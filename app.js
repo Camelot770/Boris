@@ -444,7 +444,7 @@ function renderDashboard(flags) {
   <div class="two-col">
     <div class="card"><div class="card-title">🚩 Красные флаги <span class="hint">материальные и денежные просрочки</span></div>${flagsHTML}</div>
     <div>
-      <div class="card"><div class="card-title">📅 Платежи ближайших 14 дней</div>${calHTML}</div>
+      <div class="card"><div class="card-title">📅 Платежи <span class="hint">просроченные и ближайшие 14 дней</span></div>${calHTML}</div>
       <div class="card"><div class="card-title">🗒 Последние проведения</div>${lastJournal}</div>
     </div>
   </div>`;
@@ -480,15 +480,15 @@ function renderDeals() {
     return `<tr>
       <td><div class="cell-main">${esc(d.name)}</div><div class="cell-sub">${esc(d.counterparty)}</div></td>
       <td><span class="badge ${d.kind === 'sale' ? 'badge-green' : 'badge-blue'}">${DEAL_KIND[d.kind].label}</span></td>
-      <td class="uuid" data-action="copy-uuid" data-id="${d.id}" title="Скопировать полный UUID">${shortId(d.id)}…</td>
+      <td class="uuid" data-action="copy-uuid" data-id="${esc(d.id)}" title="Скопировать полный UUID">${esc(shortId(d.id))}…</td>
       <td class="num">${fmtMoney(d.amount)}</td>
       <td class="num">${d.shipDays} дн.</td>
       <td class="num">${d.deferDays} дн.</td>
       <td class="num">${fmtMoney(a.paid)}</td>
       <td class="num">${fmtMoney(a.moved)}</td>
       <td><div class="row-actions">
-        <button class="btn btn-outline btn-sm" data-action="edit-deal" data-id="${d.id}">Изменить</button>
-        <button class="btn btn-outline btn-sm" data-action="del-deal" data-id="${d.id}">Удалить</button>
+        <button class="btn btn-outline btn-sm" data-action="edit-deal" data-id="${esc(d.id)}">Изменить</button>
+        <button class="btn btn-outline btn-sm" data-action="del-deal" data-id="${esc(d.id)}">Удалить</button>
       </div></td>
     </tr>`;
   }).join('');
@@ -519,10 +519,10 @@ function renderPayments() {
       <td>${p.posted ? '<span class="badge badge-green">Проведён</span>' : '<span class="badge badge-grey">Черновик</span>'}</td>
       <td><div class="row-actions">
         ${p.posted
-          ? `<button class="btn btn-outline btn-sm" data-action="unpost" data-type="payment" data-id="${p.id}">Распровести</button>`
-          : `<button class="btn btn-primary btn-sm" data-action="post" data-type="payment" data-id="${p.id}">Провести</button>
-             <button class="btn btn-outline btn-sm" data-action="edit-payment" data-id="${p.id}">Изменить</button>
-             <button class="btn btn-outline btn-sm" data-action="del-payment" data-id="${p.id}">Удалить</button>`}
+          ? `<button class="btn btn-outline btn-sm" data-action="unpost" data-type="payment" data-id="${esc(p.id)}">Распровести</button>`
+          : `<button class="btn btn-primary btn-sm" data-action="post" data-type="payment" data-id="${esc(p.id)}">Провести</button>
+             <button class="btn btn-outline btn-sm" data-action="edit-payment" data-id="${esc(p.id)}">Изменить</button>
+             <button class="btn btn-outline btn-sm" data-action="del-payment" data-id="${esc(p.id)}">Удалить</button>`}
       </div></td>
     </tr>`;
   }).join('');
@@ -554,10 +554,10 @@ function renderWaybills() {
       <td>${w.posted ? '<span class="badge badge-green">Проведена</span>' : '<span class="badge badge-grey">Черновик</span>'}</td>
       <td><div class="row-actions">
         ${w.posted
-          ? `<button class="btn btn-outline btn-sm" data-action="unpost" data-type="waybill" data-id="${w.id}">Распровести</button>`
-          : `<button class="btn btn-primary btn-sm" data-action="post" data-type="waybill" data-id="${w.id}">Провести</button>
-             <button class="btn btn-outline btn-sm" data-action="edit-waybill" data-id="${w.id}">Изменить</button>
-             <button class="btn btn-outline btn-sm" data-action="del-waybill" data-id="${w.id}">Удалить</button>`}
+          ? `<button class="btn btn-outline btn-sm" data-action="unpost" data-type="waybill" data-id="${esc(w.id)}">Распровести</button>`
+          : `<button class="btn btn-primary btn-sm" data-action="post" data-type="waybill" data-id="${esc(w.id)}">Провести</button>
+             <button class="btn btn-outline btn-sm" data-action="edit-waybill" data-id="${esc(w.id)}">Изменить</button>
+             <button class="btn btn-outline btn-sm" data-action="del-waybill" data-id="${esc(w.id)}">Удалить</button>`}
       </div></td>
     </tr>`;
   }).join('');
@@ -888,7 +888,7 @@ function renderHelp() {
 
 function dealOptions(selectedId) {
   return state.deals.map((d) =>
-    `<option value="${d.id}" ${d.id === selectedId ? 'selected' : ''}>${esc(dealTitle(d))} — ${DEAL_KIND[d.kind].label}</option>`).join('');
+    `<option value="${esc(d.id)}" ${d.id === selectedId ? 'selected' : ''}>${esc(dealTitle(d))} — ${DEAL_KIND[d.kind].label}</option>`).join('');
 }
 
 function openDealForm(id) {
@@ -907,7 +907,7 @@ function openDealForm(id) {
       <div class="field"><label>Сумма сделки, ₽ <span class="req">*</span></label>
         <input name="amount" type="number" min="1" step="0.01" required value="${d ? d.amount : ''}"></div>
       <div class="field"><label>ID_Deal (UUID)</label>
-        <input readonly value="${d ? d.id : 'будет сгенерирован автоматически'}"></div>
+        <input readonly value="${d ? esc(d.id) : 'будет сгенерирован автоматически'}"></div>
       <div class="field"><label>Срок перемещения ТМЦ после оплаты, дней</label>
         <input name="shipDays" type="number" min="0" step="1" value="${d ? d.shipDays : 5}">
         <div class="note">Юридический блок: «отгрузить/поставить в течение N дней после оплаты». Из него считается Date_Material_Execution_Plan платёжек.</div></div>
@@ -1200,10 +1200,20 @@ function sanitizeImported(s) {
   const isDate = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
   const num = (v) => (typeof v === 'number' && isFinite(v) && v > 0 ? v : null);
   const str = (v) => (typeof v === 'string' ? v : '');
+  // id допускаются только как безопасные токены (UUID и т.п.);
+  // «грязные» id сделок заменяются с сохранением связок через idMap
+  const okId = (v) => typeof v === 'string' && /^[\w-]{1,64}$/.test(v);
+  const idMap = new Map();
+  const safeDealId = (v) => {
+    if (okId(v)) return v;
+    if (!idMap.has(v)) idMap.set(v, uuid());
+    return idMap.get(v);
+  };
+  const resolveDealRef = (v) => (okId(v) ? v : idMap.get(v));
 
   const deals = (s.deals || []).filter((d) => d && typeof d === 'object' && str(d.id) && str(d.name))
     .map((d) => ({
-      id: str(d.id), name: str(d.name), counterparty: str(d.counterparty) || '—',
+      id: safeDealId(d.id), name: str(d.name), counterparty: str(d.counterparty) || '—',
       kind: d.kind === 'purchase' ? 'purchase' : 'sale',
       amount: num(d.amount) || 0,
       shipDays: Math.max(0, parseInt(d.shipDays, 10) || 0),
@@ -1212,11 +1222,12 @@ function sanitizeImported(s) {
     }));
   const dealIds = new Set(deals.map((d) => d.id));
 
-  const payments = (s.payments || []).filter((p) => p && typeof p === 'object' && dealIds.has(p.dealId) && num(p.amount) && isDate(p.datePaymentExecution))
+  const payments = (s.payments || []).filter((p) => p && typeof p === 'object' && dealIds.has(resolveDealRef(p.dealId)) && num(p.amount) && isDate(p.datePaymentExecution))
     .map((p) => {
-      const deal = deals.find((d) => d.id === p.dealId);
+      const dealRef = resolveDealRef(p.dealId);
+      const deal = deals.find((d) => d.id === dealRef);
       return {
-        id: str(p.id) || uuid(), num: str(p.num) || 'ПП-?', dealId: p.dealId,
+        id: okId(p.id) ? p.id : uuid(), num: str(p.num) || 'ПП-?', dealId: dealRef,
         kind: DEAL_KIND[deal.kind].payKind, amount: num(p.amount),
         datePaymentExecution: p.datePaymentExecution,
         dateMaterialPlan: isDate(p.dateMaterialPlan) ? p.dateMaterialPlan : addDays(p.datePaymentExecution, deal.shipDays),
@@ -1224,12 +1235,13 @@ function sanitizeImported(s) {
       };
     });
 
-  const waybills = (s.waybills || []).filter((w) => w && typeof w === 'object' && dealIds.has(w.dealId) && num(w.amount) && isDate(w.dateMaterialFact))
+  const waybills = (s.waybills || []).filter((w) => w && typeof w === 'object' && dealIds.has(resolveDealRef(w.dealId)) && num(w.amount) && isDate(w.dateMaterialFact))
     .map((w) => {
-      const deal = deals.find((d) => d.id === w.dealId);
+      const dealRef = resolveDealRef(w.dealId);
+      const deal = deals.find((d) => d.id === dealRef);
       const isReal = w.isReal !== false;
       return {
-        id: str(w.id) || uuid(), num: str(w.num) || 'НК-?', dealId: w.dealId,
+        id: okId(w.id) ? w.id : uuid(), num: str(w.num) || 'НК-?', dealId: dealRef,
         kind: DEAL_KIND[deal.kind].wbKind, amount: num(w.amount), isReal,
         goods: str(w.goods), dateMaterialFact: w.dateMaterialFact,
         datePaymentPlan: isReal ? (isDate(w.datePaymentPlan) ? w.datePaymentPlan : addDays(w.dateMaterialFact, deal.deferDays)) : null,
@@ -1316,7 +1328,7 @@ function bindMainEvents() {
 
 document.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('hashchange', render);
-  $('#modalClose').addEventListener('click', closeModal);
+  $('#modalClose').addEventListener('click', () => closeModal());
   $('#modalBackdrop').addEventListener('click', (e) => { if (e.target === $('#modalBackdrop')) closeModal(); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('#modalBackdrop').hidden) closeModal(); });
   document.addEventListener('click', (e) => { if (e.target.closest('[data-close]')) closeModal(true); });
