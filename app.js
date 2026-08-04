@@ -72,6 +72,12 @@ function loadState() {
   return { deals: [], payments: [], waybills: [], journal: [] };
 }
 
+/* Живые остатки на сегодня: cashOpening / stockOpening (null → расчёт из документов) */
+function getSettings() {
+  if (!state.settings || typeof state.settings !== 'object') state.settings = { cashOpening: null, stockOpening: null };
+  return state.settings;
+}
+
 function save() {
   localStorage.setItem(LS_KEY, JSON.stringify(state));
 }
@@ -268,6 +274,106 @@ function cashflowEvents() {
 }
 
 /* =====================================================================
+   Главный экран: живые остатки, матрица ликвидности, прогноз по дням.
+   По спецификации «Главный экран»: Надо = Мы должны − (Живой остаток + Нам должны);
+   маркер кассового разрыва — остаток ДС к концу дня < 0,
+   маркер дефицита — остаток ТМЦ < 0. Любое проведение документа «сегодня»
+   автоматически пересчитывает весь плановый горизонт (эффект домино).
+   ===================================================================== */
+
+/* Текущие остатки: заданные вручную либо расчётные из проведённых документов */
+function currentBalances() {
+  const s = getSettings();
+  let cashCalc = 0, stockCalc = 0;
+  for (const d of state.deals) {
+    const a = dealAggregates(d);
+    cashCalc += a.moneyFact;
+    stockCalc += a.tmcFact;
+  }
+  const manualCash = typeof s.cashOpening === 'number' && isFinite(s.cashOpening);
+  const manualStock = typeof s.stockOpening === 'number' && isFinite(s.stockOpening);
+  return {
+    cash: manualCash ? s.cashOpening : cashCalc,
+    stock: manualStock ? s.stockOpening : stockCalc,
+    manualCash, manualStock, cashCalc, stockCalc,
+  };
+}
+
+/* Матрица товарно-денежного баланса (контуры ДС и ТМЦ) */
+function liquidityMatrix() {
+  const bal = currentBalances();
+  let dsIn = 0, dsOut = 0, tmcIn = 0, tmcOut = 0;
+  for (const deal of state.deals) {
+    const isSale = deal.kind === 'sale';
+    for (const o of moneyRegister(deal).open) {
+      if (isSale) dsIn += o.left; else dsOut += o.left;
+    }
+    for (const o of materialRegister(deal).open) {
+      if (isSale) tmcOut += o.left; else tmcIn += o.left;
+    }
+  }
+  return {
+    ds: { have: bal.cash, in: dsIn, out: dsOut, need: Math.max(0, dsOut - (bal.cash + dsIn)) },
+    tmc: { have: bal.stock, in: tmcIn, out: tmcOut, need: Math.max(0, tmcOut - (bal.stock + tmcIn)) },
+    bal,
+  };
+}
+
+/* Прогноз остатков по дням будущего.
+   Консервативный сценарий: просроченные ПРИТОКИ (деньги дебиторов, недошедшие
+   поставки) в прогноз не включаются — на них нельзя рассчитывать; просроченные
+   ОТТОКИ (наши долги и отгрузки) ставятся на «сегодня». */
+function computeProjection(horizon = 30) {
+  const today = todayISO();
+  const bal = currentBalances();
+  const events = [];
+  const atRisk = [];
+  for (const deal of state.deals) {
+    const isSale = deal.kind === 'sale';
+    for (const o of moneyRegister(deal).open) {
+      const overdue = o.date < today;
+      if (isSale) {
+        if (overdue) atRisk.push({ kind: 'money', amount: o.left, deal, date: o.date, ref: o.ref });
+        else events.push({ date: o.date, cash: o.left, stock: 0, label: `Оплата от ${deal.counterparty} (${o.ref})` });
+      } else {
+        events.push({ date: overdue ? today : o.date, cash: -o.left, stock: 0, label: `Оплата ${deal.counterparty} (${o.ref})`, overdue });
+      }
+    }
+    for (const o of materialRegister(deal).open) {
+      const overdue = o.date < today;
+      if (isSale) {
+        events.push({ date: overdue ? today : o.date, cash: 0, stock: -o.left, label: `Отгрузка ${deal.counterparty} (${o.ref})`, overdue });
+      } else {
+        if (overdue) atRisk.push({ kind: 'stock', amount: o.left, deal, date: o.date, ref: o.ref });
+        else events.push({ date: o.date, cash: 0, stock: o.left, label: `Поставка ${deal.counterparty} (${o.ref})` });
+      }
+    }
+  }
+  const days = [];
+  let cash = bal.cash, stock = bal.stock;
+  for (let i = 0; i <= horizon; i++) {
+    const d = addDays(today, i);
+    const evs = events.filter((e) => e.date === d);
+    cash += sum(evs.map((e) => e.cash));
+    stock += sum(evs.map((e) => e.stock));
+    days.push({ date: d, cash, stock, events: evs, cashGap: cash < -0.004, deficit: stock < -0.004 });
+  }
+  return {
+    days,
+    firstGap: days.find((x) => x.cashGap) || null,
+    firstDeficit: days.find((x) => x.deficit) || null,
+    atRisk, bal, today,
+  };
+}
+
+/* Приоритет планового оттока для платёжного календаря */
+function outflowPriority(date, today) {
+  if (date < today) return { label: 'критичный', cls: 'badge-red' };
+  if (diffDays(date, today) <= 7) return { label: 'первоочередной', cls: 'badge-amber' };
+  return { label: 'гибкий', cls: 'badge-green' };
+}
+
+/* =====================================================================
    Проведение документов — логическая матрица из спецификации
    ===================================================================== */
 
@@ -371,7 +477,7 @@ function showToast(title, lines, kind = 'blue') {
 }
 
 const ROUTES = {
-  dashboard: { title: 'Дашборд', render: renderDashboard },
+  dashboard: { title: 'Главный экран', render: renderDashboard },
   deals: { title: 'Сделки', render: renderDeals },
   payments: { title: 'Платёжные документы', render: renderPayments },
   waybills: { title: 'Накладные', render: renderWaybills },
@@ -423,34 +529,104 @@ const demoButtonHTML = `<button class="btn btn-primary" data-action="demo">За�
 function renderDashboard(flags) {
   if (!state.deals.length && !state.payments.length && !state.waybills.length) {
     return `<div class="card">${emptyBlock('grid', 'Система пуста',
-      'Создайте сделку и документы — или загрузите демонстрационный сценарий, который показывает все механики: красные флаги, календарь выплат и изоляцию виртуальных накладных.',
+      'Создайте сделку и документы — или загрузите демонстрационный сценарий, который показывает все механики: счётчик красных маркеров, матрицу ликвидности, прогноз по дням и изоляцию виртуальных накладных.',
       demoButtonHTML)}</div>`;
   }
 
-  let moneyFact = 0, receivable = 0, payable = 0;
-  for (const d of state.deals) {
-    const a = dealAggregates(d);
-    moneyFact += a.moneyFact;
-    receivable += a.receivable;
-    payable += a.payable;
-  }
+  const today = todayISO();
   const reds = flags.filter((f) => f.severity === 'red');
-  const ambers = flags.filter((f) => f.severity === 'amber');
+  const proj = computeProjection(30);
+  const mx = liquidityMatrix();
 
-  const kpi = `
-  <div class="grid-kpi">
-    <div class="kpi"><div class="kpi-label">Денежный поток (факт)</div>
-      <div class="kpi-value ${moneyFact >= 0 ? 'pos' : 'neg'}">${fmtMoneySign(moneyFact)}</div>
-      <div class="kpi-sub">по проведённым платёжкам</div></div>
-    <div class="kpi"><div class="kpi-label">Дебиторская задолженность</div>
-      <div class="kpi-value">${fmtMoney(receivable)}</div>
-      <div class="kpi-sub">нам должны</div></div>
-    <div class="kpi"><div class="kpi-label">Кредиторская задолженность</div>
-      <div class="kpi-value">${fmtMoney(payable)}</div>
-      <div class="kpi-sub">должны мы</div></div>
-    <div class="kpi"><div class="kpi-label">Красные флаги</div>
-      <div class="kpi-value ${reds.length ? 'neg' : 'pos'}">${reds.length}</div>
-      <div class="kpi-sub">${ambers.length} предупреждений</div></div>
+  /* Счётчик красных маркеров: флаги + кассовый разрыв + дефицит ТМЦ */
+  const markerCount = reds.length + (proj.firstGap ? 1 : 0) + (proj.firstDeficit ? 1 : 0);
+  const markerSubs = [];
+  if (proj.firstGap) markerSubs.push(`кассовый разрыв ${fmtDate(proj.firstGap.date)} (через ${diffDays(proj.firstGap.date, today)} дн.)`);
+  if (proj.firstDeficit) markerSubs.push(`дефицит ТМЦ ${fmtDate(proj.firstDeficit.date)}`);
+  if (reds.length) markerSubs.push(`просрочек: ${reds.length}`);
+
+  const counterHTML = `
+  <div class="marker-hero ${markerCount ? 'alert' : 'calm'}">
+    <div class="marker-count-wrap">
+      <div class="marker-count">${markerCount}</div>
+      <div class="marker-caption">красных маркеров</div>
+    </div>
+    <div class="marker-verdict">
+      ${markerCount
+        ? `<div class="marker-title">Требуется вмешательство</div>
+           <div class="marker-sub">${markerSubs.map(esc).join(' · ')}</div>
+           <button class="btn btn-outline btn-sm" style="margin-top:10px" data-action="goto-flags">Спуститься к причинам</button>`
+        : `<div class="marker-title">Бизнес работает нормально</div>
+           <div class="marker-sub">Все обязательства исполняются в срок, разрывов на горизонте 30 дней нет. Вы свободны от операционки.</div>`}
+    </div>
+    <div class="marker-balances">
+      <div class="mb-row"><span class="mb-label">Живой остаток ДС</span>
+        <span class="mb-value ${mx.ds.have < 0 ? 'neg' : ''}">${fmtMoney(mx.ds.have)}</span></div>
+      <div class="mb-row"><span class="mb-label">Запас ТМЦ на складе</span>
+        <span class="mb-value ${mx.tmc.have < 0 ? 'neg' : ''}">${fmtMoney(mx.tmc.have)}</span></div>
+      <div class="mb-note">${proj.bal.manualCash || proj.bal.manualStock ? 'заданы вручную' : 'расчёт из документов'}
+        · <button class="link-btn" data-action="edit-balances">изменить</button></div>
+    </div>
+  </div>`;
+
+  /* Матрица товарно-денежного баланса: Надо = Мы должны − (Есть + Нам должны) */
+  const matrixHTML = `
+  <div class="card">${cardTitle('table', 'Матрица товарно-денежного баланса', 'Надо = Мы должны − (Живой остаток + Нам должны)')}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Контур</th><th class="num">У нас есть</th><th class="num">Нам должны</th><th class="num">Мы должны</th><th class="num">НАДО (фокус)</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><div class="cell-main">Денежные средства</div><div class="cell-sub">счета и касса + обязательства по деньгам</div></td>
+        <td class="num ${mx.ds.have < 0 ? 'neg-cell' : ''}">${fmtMoney(mx.ds.have)}</td>
+        <td class="num">${mx.ds.in ? '+' + fmtMoney(mx.ds.in) : '—'}</td>
+        <td class="num">${mx.ds.out ? '−' + fmtMoney(mx.ds.out) : '—'}</td>
+        <td class="num">${mx.ds.need > 0
+          ? `<span class="badge badge-red">не хватает ${fmtMoney(mx.ds.need)}</span>`
+          : proj.firstGap
+            ? `<span class="badge badge-red">разрыв ${fmtDate(proj.firstGap.date)}: ${fmtMoney(proj.firstGap.cash)}</span>`
+            : '<span class="badge badge-green">покрыто</span>'}</td>
+      </tr>
+      <tr>
+        <td><div class="cell-main">Товары (ТМЦ)</div><div class="cell-sub">склад + обязательства по перемещению</div></td>
+        <td class="num ${mx.tmc.have < 0 ? 'neg-cell' : ''}">${fmtMoney(mx.tmc.have)}</td>
+        <td class="num">${mx.tmc.in ? '+' + fmtMoney(mx.tmc.in) : '—'}</td>
+        <td class="num">${mx.tmc.out ? '−' + fmtMoney(mx.tmc.out) : '—'}</td>
+        <td class="num">${mx.tmc.need > 0
+          ? `<span class="badge badge-red">дефицит ${fmtMoney(mx.tmc.need)}</span>`
+          : proj.firstDeficit
+            ? `<span class="badge badge-red">дефицит ${fmtDate(proj.firstDeficit.date)}: ${fmtMoney(proj.firstDeficit.stock)}</span>`
+            : '<span class="badge badge-green">покрыто</span>'}</td>
+      </tr>
+    </tbody>
+  </table></div>
+  <div class="legend" style="margin-top:10px">
+    <span>«Нам должны» — подтверждённая ДЗ и оплаченные недошедшие поставки</span>
+    <span>«Мы должны» — КЗ поставщикам и обязательства по отгрузке за предоплаты</span>
+  </div></div>`;
+
+  /* Прогноз по дням будущего */
+  const eventDays = proj.days.filter((d) => d.events.length || d.cashGap || d.deficit);
+  const projRows = eventDays.slice(0, 12).map((d) => `
+    <tr>
+      <td class="num">${fmtDate(d.date)}</td>
+      <td>${d.events.map((e) => `<div class="cell-sub">${e.cash > 0 || e.stock > 0 ? '+' : '−'} ${esc(e.label)}${e.overdue ? ' <span class="badge badge-red">просрочено → сегодня</span>' : ''}</div>`).join('') || '<span class="cell-sub">—</span>'}</td>
+      <td class="num ${d.cashGap ? 'neg-cell' : ''}">${fmtMoney(d.cash)}${d.cashGap ? ' ⚑' : ''}</td>
+      <td class="num ${d.deficit ? 'neg-cell' : ''}">${fmtMoney(d.stock)}${d.deficit ? ' ⚑' : ''}</td>
+    </tr>`).join('');
+
+  const atRiskHTML = proj.atRisk.length
+    ? `<div class="callout callout-grey" style="margin-top:12px">Вне прогноза (просроченные притоки, на них нельзя рассчитывать): ${proj.atRisk.map((r) =>
+        esc(`${r.kind === 'money' ? 'оплата' : 'поставка'} ${fmtMoney(r.amount)} от ${r.deal.counterparty} (ждали ${fmtDate(r.date)})`)).join('; ')}.</div>`
+    : '';
+
+  const projHTML = `
+  <div class="card">${cardTitle('chart', 'Прогноз остатков на 30 дней', 'эффект домино: каждый проведённый документ пересчитывает график')}
+    ${svgProjection(proj)}
+    ${eventDays.length ? `<div class="table-wrap" style="margin-top:14px"><table>
+      <thead><tr><th class="num">Дата</th><th>События дня</th><th class="num">ДС на конец дня</th><th class="num">ТМЦ на конец дня</th></tr></thead>
+      <tbody>${projRows}</tbody>
+    </table></div>` : '<p style="color:var(--ink-soft);font-size:13px;margin-top:10px">Открытых плановых обязательств на горизонте нет.</p>'}
+    ${atRiskHTML}
   </div>`;
 
   const flagsHTML = flags.length
@@ -458,23 +634,69 @@ function renderDashboard(flags) {
     : `<div class="empty" style="padding:24px"><div class="empty-ico">${ic('check', 30)}</div><div class="empty-title">Флагов нет</div><p>Все обязательства исполняются в срок.</p></div>`;
 
   const events = cashflowEvents().filter((e) => e.plan);
-  const today = todayISO();
   const horizon = addDays(today, 14);
   const upcoming = events.filter((e) => e.date <= horizon).slice(0, 8);
   const calHTML = upcoming.length
-    ? upcoming.map((e) => calEventHTML(e, today)).join('')
+    ? upcoming.map((e) => calEventHTML(e, today, true)).join('')
     : `<div class="empty" style="padding:24px"><div class="empty-ico">${ic('banknote', 30)}</div><div class="empty-title">Плановых платежей нет</div><p>Ближайшие 14 дней свободны от денежных обязательств.</p></div>`;
 
   const lastJournal = state.journal.slice(0, 4).map(journalEntryHTML).join('') ||
-    `<p style="color:var(--muted);font-size:13px">Документы ещё не проводились.</p>`;
+    `<p style="color:var(--ink-soft);font-size:13px">Документы ещё не проводились.</p>`;
 
-  return `${kpi}
-  <div class="two-col">
+  return `${counterHTML}
+  ${matrixHTML}
+  ${projHTML}
+  <div class="two-col" id="dash-flags">
     <div class="card">${cardTitle('flag', 'Красные флаги', 'материальные и денежные просрочки')}${flagsHTML}</div>
     <div>
-      <div class="card">${cardTitle('calendar', 'Платежи', 'просроченные и ближайшие 14 дней')}${calHTML}</div>
+      <div class="card">${cardTitle('calendar', 'Платёжный календарь', 'приоритеты: критичный · первоочередной · гибкий')}${calHTML}</div>
       <div class="card">${cardTitle('ledger', 'Последние проведения')}${lastJournal}</div>
     </div>
+  </div>`;
+}
+
+/* Ступенчатый график прогноза: ДС (тушь) и ТМЦ (охра), красное — ниже нуля */
+function svgProjection(proj) {
+  const days = proj.days;
+  if (!days.length) return '';
+  const W = 860, H = 240, PL = 84, PR = 20, PT = 14, PB = 28;
+  const vals = days.flatMap((d) => [d.cash, d.stock]).concat([0]);
+  const vmin = Math.min(...vals), vmax = Math.max(...vals);
+  const vspan = Math.max(1, vmax - vmin);
+  const x = (i) => PL + ((W - PL - PR) * i) / Math.max(1, days.length - 1);
+  const y = (v) => PT + (H - PT - PB) * (1 - (v - vmin) / vspan);
+
+  const path = (key) => days.map((d, i) => {
+    const px = x(i).toFixed(1), py = y(d[key]).toFixed(1);
+    return i === 0 ? `M ${px} ${py}` : `L ${px} ${(y(days[i - 1][key])).toFixed(1)} L ${px} ${py}`;
+  }).join(' ');
+
+  const markers = days.map((d, i) => {
+    let out = '';
+    if (d.cashGap) out += `<circle cx="${x(i).toFixed(1)}" cy="${y(d.cash).toFixed(1)}" r="4" fill="#9e2b25" stroke="#fbfaf5" stroke-width="1.5"><title>${esc(fmtDate(d.date) + ' — кассовый разрыв: ' + fmtMoney(d.cash))}</title></circle>`;
+    if (d.deficit) out += `<rect x="${(x(i) - 3.5).toFixed(1)}" y="${(y(d.stock) - 3.5).toFixed(1)}" width="7" height="7" fill="#9e2b25" stroke="#fbfaf5" stroke-width="1.5"><title>${esc(fmtDate(d.date) + ' — дефицит ТМЦ: ' + fmtMoney(d.stock))}</title></rect>`;
+    return out;
+  }).join('');
+
+  const zeroY = y(0);
+  const fmtShort = (v) => (Math.abs(v) >= 1e6 ? (v / 1e6).toFixed(1) + ' млн' : Math.abs(v) >= 1e3 ? Math.round(v / 1e3) + ' тыс' : String(Math.round(v)));
+  const grid = [vmax, (vmax + vmin) / 2, vmin].map((v) =>
+    `<line x1="${PL}" y1="${y(v).toFixed(1)}" x2="${W - PR}" y2="${y(v).toFixed(1)}" stroke="#e6e0cf" stroke-width="1"/>
+     <text x="${PL - 8}" y="${(y(v) + 4).toFixed(1)}" font-size="11" fill="#7a725d" text-anchor="end" font-family="PT Sans, sans-serif">${fmtShort(v)}</text>`).join('');
+
+  return `<svg class="timeline-svg" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Прогноз остатков">
+    ${grid}
+    <line x1="${PL}" y1="${zeroY.toFixed(1)}" x2="${W - PR}" y2="${zeroY.toFixed(1)}" stroke="#b8ae95" stroke-width="1.5" stroke-dasharray="2 3"/>
+    <path d="${path('cash')}" fill="none" stroke="#1c1a15" stroke-width="2" stroke-linejoin="round"/>
+    <path d="${path('stock')}" fill="none" stroke="#8a6d1f" stroke-width="1.8" stroke-dasharray="7 4" stroke-linejoin="round"/>
+    ${markers}
+    <text x="${PL}" y="${H - 10}" font-size="10" fill="#7a725d" font-family="PT Sans, sans-serif">${fmtDate(days[0].date)} (сегодня)</text>
+    <text x="${W - PR}" y="${H - 10}" font-size="10" fill="#7a725d" text-anchor="end" font-family="PT Sans, sans-serif">${fmtDate(days[days.length - 1].date)}</text>
+  </svg>
+  <div class="legend" style="margin-top:8px">
+    <span><i style="background:#1c1a15"></i> остаток ДС</span>
+    <span><i style="background:#8a6d1f"></i> запас ТМЦ (в ₽)</span>
+    <span><i style="background:#9e2b25"></i> маркер: разрыв / дефицит</span>
   </div>`;
 }
 
@@ -492,13 +714,54 @@ function flagItemHTML(f) {
   </div>`;
 }
 
-function calEventHTML(e, today) {
+function calEventHTML(e, today, withPriority) {
   const overdue = e.plan && e.date < today;
+  // приоритет ранжирует только оттоки (докс: критичные / первоочередные / гибкие)
+  const prio = withPriority && e.plan && e.dir === 'out' ? outflowPriority(e.date, today) : null;
   return `<div class="cal-event ${e.dir} ${overdue ? 'overdue' : ''}">
     <span class="badge ${e.plan ? (overdue ? 'badge-red' : 'badge-blue') : 'badge-grey'}">${overdue ? 'просрочено' : e.plan ? 'план' : 'факт'}</span>
+    ${prio ? `<span class="badge ${prio.cls}">${prio.label}</span>` : ''}
     <span>${fmtDate(e.date)} · ${esc(e.label)}</span>
     <span class="amt">${e.dir === 'in' ? '+' : '−'}${fmtMoney(Math.abs(e.amount))}</span>
   </div>`;
+}
+
+/* Форма живых остатков на сегодня */
+function openBalancesForm() {
+  const s = getSettings();
+  const bal = currentBalances();
+  openModal('Живые остатки на сегодня', `
+    <form id="frm" class="form-grid">
+      <div class="field full"><label>Остаток денежных средств, ₽</label>
+        <input name="cashOpening" type="number" step="0.01" value="${bal.manualCash ? s.cashOpening : ''}" placeholder="расчётный: ${fmtMoney(bal.cashCalc)}">
+        <div class="note">Деньги на счетах и в кассе на сегодня — из банковской выписки. Пусто — берётся расчёт из проведённых платёжек.</div></div>
+      <div class="field full"><label>Запас ТМЦ на складе, ₽</label>
+        <input name="stockOpening" type="number" step="0.01" value="${bal.manualStock ? s.stockOpening : ''}" placeholder="расчётный: ${fmtMoney(bal.stockCalc)}">
+        <div class="note">Фактический складской запас в оценке — из инвентаризации. Пусто — расчёт из реальных накладных.</div></div>
+      <div class="form-actions full">
+        <button type="button" class="btn btn-outline" data-close>Отмена</button>
+        <button type="submit" class="btn btn-primary">Сохранить остатки</button>
+      </div>
+    </form>`, (body) => {
+    body.querySelector('#frm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const f = new FormData(e.target);
+      const parse = (v) => {
+        const t = String(v).trim();
+        if (!t) return null;
+        const n = parseFloat(t);
+        return isFinite(n) ? n : null;
+      };
+      const st = getSettings();
+      st.cashOpening = parse(f.get('cashOpening'));
+      st.stockOpening = parse(f.get('stockOpening'));
+      save(); closeModal(true); render();
+      showToast('Остатки обновлены', [
+        `ДС: ${st.cashOpening != null ? fmtMoney(st.cashOpening) + ' (вручную)' : 'расчёт из документов'}`,
+        `ТМЦ: ${st.stockOpening != null ? fmtMoney(st.stockOpening) + ' (вручную)' : 'расчёт из документов'}`,
+      ]);
+    });
+  });
 }
 
 /* ---------- Сделки ---------- */
@@ -906,6 +1169,17 @@ function renderHelp() {
       <li><b>Бухгалтер</b> по снабжению/продажам при разнесении выписки видит чёткие плановые ориентиры по деньгам — это исключает кассовые разрывы.</li>
       <li><b>Бухгалтер по материалам</b>, выставляя Is_Real = НЕТ в корректирующих накладных, полностью изолирует свои действия: документы не порождают плановых дат и не сбивают сроки в логистике и финансах.</li>
     </ul>
+
+    <h2>4. Главный экран руководителя</h2>
+    <p>Компания на одной панели управления — единая матрица товарно-денежного баланса по датам будущего.</p>
+    <ul>
+      <li><b>Счётчик красных маркеров.</b> Ноль — бизнес работает нормально, руководитель свободен от операционки. Появился маркер — в один клик спускаетесь к конкретной причине: просрочке, кассовому разрыву или дефициту ТМЦ.</li>
+      <li><b>Матрица баланса</b> по двум контурам (деньги и ТМЦ): <i>У нас есть</i> — живой остаток на счетах и фактический запас склада; <i>Нам должны</i> — подтверждённая ДЗ и оплаченные недошедшие поставки; <i>Мы должны</i> — КЗ поставщикам и обязательства по отгрузке за предоплаты; <i>НАДО</i> — фокус внимания: <code>Надо = Мы должны − (Живой остаток + Нам должны)</code>.</li>
+      <li><b>Прогноз остатков по дням.</b> На каждый день будущего система считает остаток ДС и склада: маркер кассового разрыва — остаток к концу дня &lt; 0; маркер дефицита — склад &lt; 0. Разрыв виден за недели до наступления. Консервативный сценарий: на просроченные притоки система не рассчитывает.</li>
+      <li><b>«Эффект домино».</b> Любой проведённый документ «сегодня» мгновенно пересчитывает весь плановый горизонт — регистры выводятся из документов, а не хранятся отдельно.</li>
+      <li><b>Платёжный календарь с приоритетами</b> оттоков: критичный (просрочен) → первоочередной (ближайшие 7 дней) → гибкий.</li>
+      <li><b>Живые остатки</b> ДС и склада задаются вручную (из выписки и инвентаризации) или считаются из проведённых документов.</li>
+    </ul>
     <div class="callout callout-grey">Данные хранятся локально в браузере (localStorage). «Экспорт» выгружает всё в JSON, «Импорт» — восстанавливает.</div>
   </div>`;
 }
@@ -1161,7 +1435,9 @@ function loadDemo() {
   const dAgro = { id: uuid(), name: 'Закупка удобрений', counterparty: 'ООО «АгроСнаб»', kind: 'purchase', amount: 320000, shipDays: 0, deferDays: 15, comment: 'Отсрочка 15 дней после приёмки' };
   const dTehno = { id: uuid(), name: 'Договор продажи №7', counterparty: 'ООО «ТехноДом»', kind: 'sale', amount: 560000, shipDays: 3, deferDays: 20, comment: 'Отсрочка 20 дней после отгрузки' };
 
-  state = { deals: [dRomashka, dStal, dAgro, dTehno], payments: [], waybills: [], journal: [] };
+  // живые остатки: разрыв возникает в будущем при выплате АгроСнабу — виден заранее
+  state = { deals: [dRomashka, dStal, dAgro, dTehno], payments: [], waybills: [], journal: [],
+    settings: { cashOpening: 250000, stockOpening: 400000 } };
 
   const mkPay = (deal, num, amount, dayOffset) => ({
     id: uuid(), num, dealId: deal.id, kind: DEAL_KIND[deal.kind].payKind, amount,
@@ -1280,7 +1556,12 @@ function sanitizeImported(s) {
   const journal = (Array.isArray(s.journal) ? s.journal : []).filter((j) => j && typeof j === 'object' && str(j.doc))
     .map((j) => ({ ts: str(j.ts) || new Date().toISOString(), doc: str(j.doc), deal: str(j.deal), real: j.real !== false, lines: Array.isArray(j.lines) ? j.lines.map(str) : [] }));
 
-  return { deals, payments, waybills, journal };
+  const numOrNull = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
+  const settings = s.settings && typeof s.settings === 'object'
+    ? { cashOpening: numOrNull(s.settings.cashOpening), stockOpening: numOrNull(s.settings.stockOpening) }
+    : { cashOpening: null, stockOpening: null };
+
+  return { deals, payments, waybills, journal, settings };
 }
 
 function importJSON(file) {
@@ -1350,6 +1631,8 @@ function bindMainEvents() {
       else if (a === 'post') postDocument(type, id);
       else if (a === 'unpost') unpostDocument(type, id);
       else if (a === 'copy-uuid') copyText(id);
+      else if (a === 'edit-balances') openBalancesForm();
+      else if (a === 'goto-flags') document.getElementById('dash-flags')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
   });
 }
