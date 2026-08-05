@@ -60,6 +60,7 @@ const shortId = (id) => (id ? id.slice(0, 8) : '—');
 const LS_KEY = 'boris-uchet-v1';
 
 let state = loadState();
+ensureCollections();
 
 function loadState() {
   try {
@@ -70,6 +71,12 @@ function loadState() {
     }
   } catch (e) { /* повреждённые данные — начинаем с чистого листа */ }
   return { deals: [], payments: [], waybills: [], journal: [] };
+}
+
+/* Ленивая инициализация коллекций, добавленных позже первой версии */
+function ensureCollections() {
+  if (!Array.isArray(state.items)) state.items = [];
+  if (!Array.isArray(state.otherPayments)) state.otherPayments = [];
 }
 
 /* Живые остатки на сегодня: cashOpening / stockOpening (null → расчёт из документов) */
@@ -91,6 +98,53 @@ const PAY_KIND = { in: 'Входящий', out: 'Исходящий' };
 const WB_KIND = { in: 'Приходная', out: 'Расходная' };
 
 const dealById = (id) => state.deals.find((d) => d.id === id);
+const itemById = (id) => state.items.find((i) => i.id === id);
+
+/* Категории прочих платежей (вне сделок) и приоритеты по умолчанию */
+const OTHER_CATEGORIES = {
+  taxes: { label: 'Налоги', prio: 'critical' },
+  salary: { label: 'Зарплата', prio: 'critical' },
+  rent: { label: 'Аренда', prio: 'primary' },
+  admin: { label: 'Адм.-хоз. расходы', prio: 'primary' },
+  dividends: { label: 'Дивиденды', prio: 'discretionary' },
+  other: { label: 'Прочее', prio: 'flexible' },
+};
+const PRIORITIES = {
+  critical: { label: 'критичный', cls: 'badge-red', order: 0 },
+  primary: { label: 'первоочередной', cls: 'badge-amber', order: 1 },
+  flexible: { label: 'гибкий', cls: 'badge-green', order: 2 },
+  discretionary: { label: 'дискреционный', cls: 'badge-grey', order: 3 },
+};
+
+/* Вхождения прочего платежа в горизонте (повторяющиеся разворачиваются на лету).
+   Ежемесячные считаются от базовой даты с зажимом дня месяца (31-е → 28/30-е),
+   без дрейфа при переходе через короткие месяцы. */
+function otherPaymentOccurrences(p, from, to) {
+  if (p.done) return [];
+  const out = [];
+  if (p.recurring === 'monthly') {
+    // индексы месяцев считаются от окна [from, to], а не перебором от базовой
+    // даты — сколь угодно старая серия не «истекает»
+    const [by, bm, bd] = p.date.split('-').map(Number);
+    const [fy, fm] = from.split('-').map(Number);
+    const [ty, tm] = to.split('-').map(Number);
+    const startIdx = Math.max(0, (fy - by) * 12 + (fm - bm) - 1);
+    const endIdx = Math.max(startIdx, (ty - by) * 12 + (tm - bm) + 1);
+    for (let i = startIdx; i <= endIdx; i++) {
+      const total = bm - 1 + i;
+      const y = by + Math.floor(total / 12), m = (total % 12) + 1;
+      const last = new Date(y, m, 0).getDate();
+      const d = `${y}-${String(m).padStart(2, '0')}-${String(Math.min(bd, last)).padStart(2, '0')}`;
+      if (d > to) break;
+      if (d >= from) out.push(d);
+    }
+  } else if (p.date >= from && p.date <= to) {
+    out.push(p.date);
+  } else if (p.date < from) {
+    out.push(from); // просроченный разовый платёж — ожидается немедленно
+  }
+  return out;
+}
 const dealTitle = (d) => (d ? `${d.name} · ${d.counterparty}` : 'сделка удалена');
 
 const postedPayments = (dealId) =>
@@ -123,7 +177,7 @@ function nextNum(list, prefix) {
 function fifoMatch(quotas, facts) {
   const q = quotas
     .filter((x) => x.date)
-    .map((x) => ({ date: x.date, left: x.amount, ref: x.ref }))
+    .map((x) => ({ date: x.date, left: x.amount, ref: x.ref, key: x.key }))
     .sort((a, b) => a.date.localeCompare(b.date));
   const late = [];
   const sortedFacts = [...facts].sort((a, b) => a.date.localeCompare(b.date));
@@ -140,14 +194,14 @@ function fifoMatch(quotas, facts) {
       if (head.left <= 0.004) q.shift();
     }
   }
-  return { late, open: q.filter((x) => x.left > 0.004).map((x) => ({ date: x.date, left: x.left, ref: x.ref })) };
+  return { late, open: q.filter((x) => x.left > 0.004).map((x) => ({ date: x.date, left: x.left, ref: x.ref, key: x.key })) };
 }
 
 /* Материальный контур сделки */
 function materialRegister(deal) {
   const quotas = postedPayments(deal.id)
     .filter((p) => p.dateMaterialPlan)
-    .map((p) => ({ date: p.dateMaterialPlan, amount: p.amount, ref: p.num }));
+    .map((p) => ({ date: p.dateMaterialPlan, amount: p.amount, ref: p.num, key: p.id }));
   const facts = postedRealWaybills(deal.id)
     .map((w) => ({ date: w.dateMaterialFact, amount: w.amount, ref: w.num, key: w.id }));
   return fifoMatch(quotas, facts);
@@ -157,7 +211,7 @@ function materialRegister(deal) {
 function moneyRegister(deal) {
   const quotas = postedRealWaybills(deal.id)
     .filter((w) => w.datePaymentPlan)
-    .map((w) => ({ date: w.datePaymentPlan, amount: w.amount, ref: w.num }));
+    .map((w) => ({ date: w.datePaymentPlan, amount: w.amount, ref: w.num, key: w.id }));
   const facts = postedPayments(deal.id)
     .map((p) => ({ date: p.datePaymentExecution, amount: p.amount, ref: p.num }));
   return fifoMatch(quotas, facts);
@@ -269,6 +323,19 @@ function cashflowEvents() {
       });
     }
   }
+  // прочие платежи: ближайшие 60 дней, со своим приоритетом
+  const today = todayISO();
+  for (const p of state.otherPayments) {
+    const cat = OTHER_CATEGORIES[p.category] || OTHER_CATEGORIES.other;
+    const overdueOnce = p.recurring !== 'monthly' && p.date < today;
+    for (const d of otherPaymentOccurrences(p, today, addDays(today, 60))) {
+      events.push({
+        date: d, amount: -p.amount, plan: true,
+        label: `${p.name} · ${cat.label}${p.recurring === 'monthly' ? ' (ежемесячно)' : ''}${overdueOnce ? ` — просрочен с ${fmtDate(p.date)}` : ''}`,
+        dir: 'out', prio: overdueOnce ? 'critical' : p.priority,
+      });
+    }
+  }
   events.sort((a, b) => a.date.localeCompare(b.date));
   return events;
 }
@@ -312,6 +379,12 @@ function liquidityMatrix() {
       if (isSale) tmcOut += o.left; else tmcIn += o.left;
     }
   }
+  // прочие обязательные платежи ближайших 30 дней (аренда, налоги, зарплата…)
+  const today = todayISO();
+  const horizonEnd = addDays(today, 30);
+  for (const p of state.otherPayments) {
+    dsOut += p.amount * otherPaymentOccurrences(p, today, horizonEnd).length;
+  }
   return {
     ds: { have: bal.cash, in: dsIn, out: dsOut, need: Math.max(0, dsOut - (bal.cash + dsIn)) },
     tmc: { have: bal.stock, in: tmcIn, out: tmcOut, need: Math.max(0, tmcOut - (bal.stock + tmcIn)) },
@@ -322,10 +395,15 @@ function liquidityMatrix() {
 /* Прогноз остатков по дням будущего.
    Консервативный сценарий: просроченные ПРИТОКИ (деньги дебиторов, недошедшие
    поставки) в прогноз не включаются — на них нельзя рассчитывать; просроченные
-   ОТТОКИ (наши долги и отгрузки) ставятся на «сегодня». */
-function computeProjection(horizon = 30) {
+   ОТТОКИ (наши долги и отгрузки) ставятся на «сегодня».
+   sim — необязательный сценарий симулятора «Что если?»:
+     {kind:'shift', src:'wb'|'other', id, newDate}  — сдвиг планового оттока
+     {kind:'early', src:'wb', id}                   — досрочный приток просроченной ДЗ
+     {kind:'drop',  src:'other', id}                — отказ от дискреционного расхода */
+function computeProjection(horizon = 30, sim = null) {
   const today = todayISO();
   const bal = currentBalances();
+  const horizonEnd = addDays(today, horizon);
   const events = [];
   const atRisk = [];
   for (const deal of state.deals) {
@@ -333,10 +411,20 @@ function computeProjection(horizon = 30) {
     for (const o of moneyRegister(deal).open) {
       const overdue = o.date < today;
       if (isSale) {
-        if (overdue) atRisk.push({ kind: 'money', amount: o.left, deal, date: o.date, ref: o.ref });
-        else events.push({ date: o.date, cash: o.left, stock: 0, label: `Оплата от ${deal.counterparty} (${o.ref})` });
+        if (overdue) {
+          if (sim && sim.kind === 'early' && sim.src === 'wb' && sim.id === o.key) {
+            events.push({ date: addDays(today, 1), cash: o.left, stock: 0, label: `Досрочная оплата от ${deal.counterparty} (${o.ref})`, sim: true });
+          } else {
+            atRisk.push({ kind: 'money', amount: o.left, deal, date: o.date, ref: o.ref, key: o.key });
+          }
+        } else {
+          events.push({ date: o.date, cash: o.left, stock: 0, label: `Оплата от ${deal.counterparty} (${o.ref})` });
+        }
       } else {
-        events.push({ date: overdue ? today : o.date, cash: -o.left, stock: 0, label: `Оплата ${deal.counterparty} (${o.ref})`, overdue });
+        let date = overdue ? today : o.date;
+        let simmed = false;
+        if (sim && sim.kind === 'shift' && sim.src === 'wb' && sim.id === o.key) { date = sim.newDate; simmed = true; }
+        events.push({ date, cash: -o.left, stock: 0, label: `Оплата ${deal.counterparty} (${o.ref})`, overdue: overdue && !simmed, sim: simmed, src: 'wb', srcId: o.key });
       }
     }
     for (const o of materialRegister(deal).open) {
@@ -344,9 +432,27 @@ function computeProjection(horizon = 30) {
       if (isSale) {
         events.push({ date: overdue ? today : o.date, cash: 0, stock: -o.left, label: `Отгрузка ${deal.counterparty} (${o.ref})`, overdue });
       } else {
-        if (overdue) atRisk.push({ kind: 'stock', amount: o.left, deal, date: o.date, ref: o.ref });
+        if (overdue) atRisk.push({ kind: 'stock', amount: o.left, deal, date: o.date, ref: o.ref, key: o.key });
         else events.push({ date: o.date, cash: 0, stock: o.left, label: `Поставка ${deal.counterparty} (${o.ref})` });
       }
+    }
+  }
+  // прочие платежи (вне сделок): аренда, налоги, зарплата, дискреционные
+  for (const p of state.otherPayments) {
+    if (sim && sim.kind === 'drop' && sim.src === 'other' && sim.id === p.id) continue;
+    let occ = otherPaymentOccurrences(p, today, horizonEnd);
+    if (sim && sim.kind === 'shift' && sim.src === 'other' && sim.id === p.id && occ.length) {
+      occ = [sim.newDate, ...occ.slice(1)];
+    }
+    const cat = OTHER_CATEGORIES[p.category] || OTHER_CATEGORIES.other;
+    for (const [i, d] of occ.entries()) {
+      events.push({
+        date: d, cash: -p.amount, stock: 0,
+        label: `${p.name} (${cat.label.toLowerCase()})`,
+        overdue: p.date < today && p.recurring !== 'monthly',
+        sim: !!(sim && sim.kind === 'shift' && sim.src === 'other' && sim.id === p.id && i === 0),
+        src: 'other', srcId: p.id, prio: p.priority,
+      });
     }
   }
   const days = [];
@@ -366,11 +472,234 @@ function computeProjection(horizon = 30) {
   };
 }
 
-/* Приоритет планового оттока для платёжного календаря */
-function outflowPriority(date, today) {
-  if (date < today) return { label: 'критичный', cls: 'badge-red' };
-  if (diffDays(date, today) <= 7) return { label: 'первоочередной', cls: 'badge-amber' };
-  return { label: 'гибкий', cls: 'badge-green' };
+/* =====================================================================
+   Симулятор «Что если?» — готовые решения при кассовом разрыве
+   ===================================================================== */
+
+function generateSolutions(proj, horizon = 30) {
+  if (!proj.firstGap) return [];
+  const sols = [];
+  const today = proj.today;
+  const gapDays = proj.days.filter((d) => d.cashGap);
+  const lastGapDate = gapDays[gapDays.length - 1].date;
+
+  const describe = (sim) => {
+    const p2 = computeProjection(horizon, sim);
+    if (!p2.firstGap) return { resolved: true, text: 'разрыв полностью устраняется' };
+    if (p2.firstGap.date > proj.firstGap.date || p2.days.filter((d) => d.cashGap).length < gapDays.length) {
+      return { resolved: false, text: `разрыв сокращается (останется с ${fmtDate(p2.firstGap.date)})` };
+    }
+    return null; // не улучшает — не предлагаем
+  };
+
+  // 1) сдвиг плановых оттоков, попадающих в зону разрыва
+  const outflows = [];
+  for (const d of proj.days) {
+    if (d.date > lastGapDate) break;
+    for (const e of d.events) {
+      // ежемесячные серии сдвигом одного вхождения не решаются — не предлагаем
+      if (e.cash < 0 && e.src && !(e.src === 'other' &&
+        state.otherPayments.find((x) => x.id === e.srcId)?.recurring === 'monthly')) {
+        outflows.push({ ...e, date: d.date });
+      }
+    }
+  }
+  const seen = new Set();
+  for (const o of outflows) {
+    if (seen.has(o.src + o.srcId)) continue;
+    seen.add(o.src + o.srcId);
+    // ищем ближайшую дату сдвига, при которой разрыв уходит
+    for (let i = diffDays(lastGapDate, today) + 1; i <= horizon; i++) {
+      const sim = { kind: 'shift', src: o.src, id: o.srcId, newDate: addDays(today, i) };
+      const eff = describe(sim);
+      if (eff && eff.resolved) {
+        sols.push({ sim, title: `Сдвинуть «${o.label}» ${fmtMoney(-o.cash)} на ${fmtDate(sim.newDate)}`, effect: eff.text });
+        break;
+      }
+    }
+  }
+
+  // 2) досрочная оплата просроченной дебиторки
+  for (const r of proj.atRisk.filter((x) => x.kind === 'money')) {
+    const sim = { kind: 'early', src: 'wb', id: r.key };
+    const eff = describe(sim);
+    if (eff) sols.push({ sim, title: `Запросить досрочную оплату у ${r.deal.counterparty}: ${fmtMoney(r.amount)} (${r.ref})`, effect: eff.text });
+  }
+
+  // 3) отказ от дискреционных расходов — предлагаем и при частичном эффекте
+  const minCash = (p) => Math.min(...p.days.map((d) => d.cash));
+  for (const p of state.otherPayments.filter((x) => !x.done && x.priority === 'discretionary')) {
+    const sim = { kind: 'drop', src: 'other', id: p.id };
+    let eff = describe(sim);
+    if (!eff) {
+      const p2 = computeProjection(horizon, sim);
+      const before = minCash(proj), after = minCash(p2);
+      if (after > before + 0.004) eff = { resolved: false, text: `глубина разрыва уменьшится: ${fmtMoney(before)} → ${fmtMoney(after)}` };
+    }
+    if (eff) sols.push({ sim, title: `Отказаться от «${p.name}» (${fmtMoney(p.amount)}${p.recurring === 'monthly' ? '/мес' : ''})`, effect: eff.text });
+  }
+
+  return sols.slice(0, 4);
+}
+
+/* Активный сценарий моделирования (не сохраняется, живёт до перезагрузки) */
+let simulation = null;
+let lastSolutions = [];
+
+function applySimulation() {
+  if (!simulation) return;
+  const sim = simulation;
+  const today = todayISO();
+  // цель могла быть удалена или изменена, пока шло моделирование
+  const target = sim.src === 'wb'
+    ? state.waybills.find((w) => w.id === sim.id)
+    : state.otherPayments.find((x) => x.id === sim.id);
+  if (!target) {
+    simulation = null;
+    showToast('Сценарий не применён', ['Документ сценария не найден — данные изменились. Пересчитайте решения.'], 'red');
+    render();
+    return;
+  }
+  if (sim.src === 'wb') {
+    const wb = state.waybills.find((w) => w.id === sim.id);
+    if (wb) {
+      const oldDate = wb.datePaymentPlan;
+      wb.datePaymentPlan = sim.kind === 'early' ? addDays(today, 1) : sim.newDate;
+      state.journal.unshift({
+        ts: new Date().toISOString(),
+        doc: `Накладная ${wb.num}`,
+        deal: dealById(wb.dealId) ? dealTitle(dealById(wb.dealId)) : '—',
+        real: true,
+        lines: [`Корректировка_Плановой_Даты(${fmtDate(oldDate)} → ${fmtDate(wb.datePaymentPlan)})`,
+          sim.kind === 'early' ? '// дебитор подтвердил досрочную оплату' : '// сценарий симулятора утверждён руководителем'],
+      });
+    }
+  } else if (sim.src === 'other') {
+    const p = state.otherPayments.find((x) => x.id === sim.id);
+    if (p) {
+      if (sim.kind === 'drop') {
+        p.done = true;
+        state.journal.unshift({ ts: new Date().toISOString(), doc: `Прочий платёж «${p.name}»`, deal: '—', real: true,
+          lines: ['Отказ_От_Расхода() — дискреционный платёж исключён из графика'] });
+      } else {
+        const oldDate = p.date;
+        p.date = sim.newDate;
+        state.journal.unshift({ ts: new Date().toISOString(), doc: `Прочий платёж «${p.name}»`, deal: '—', real: true,
+          lines: [`Корректировка_Плановой_Даты(${fmtDate(oldDate)} → ${fmtDate(p.date)})`, '// сценарий симулятора утверждён руководителем'] });
+      }
+    }
+  }
+  simulation = null;
+  save();
+  showToast('Сценарий утверждён', ['График будущего пересчитан (эффект домино)']);
+  render();
+}
+
+/* =====================================================================
+   Склад по номенклатуре: остатки в натуре, дефицит и залежалость по позициям
+   ===================================================================== */
+
+/* Фактические движения позиции из строк реальных проведённых накладных */
+function itemMovements(itemId) {
+  const moves = [];
+  for (const w of state.waybills) {
+    if (!w.posted || !w.isReal || !Array.isArray(w.lines)) continue;
+    for (const l of w.lines) {
+      if (l.itemId !== itemId) continue;
+      moves.push({ date: w.dateMaterialFact, qty: w.kind === 'in' ? l.qty : -l.qty, num: w.num });
+    }
+  }
+  moves.sort((a, b) => a.date.localeCompare(b.date));
+  return moves;
+}
+
+/* Плановые движения позиции: остаток обязательств по строкам сделок.
+   Плановая дата — ближайшая открытая материальная квота сделки. */
+function itemPlanMoves(itemId, today) {
+  const plans = [];
+  for (const deal of state.deals) {
+    if (!Array.isArray(deal.lines)) continue;
+    const plannedQty = sum(deal.lines.filter((l) => l.itemId === itemId).map((l) => l.qty));
+    if (plannedQty <= 0) continue;
+    let factQty = 0;
+    for (const w of state.waybills) {
+      if (!w.posted || !w.isReal || w.dealId !== deal.id || !Array.isArray(w.lines)) continue;
+      for (const l of w.lines) if (l.itemId === itemId) factQty += l.qty;
+    }
+    const remaining = Math.max(0, plannedQty - factQty);
+    if (remaining <= 0) continue;
+    const open = materialRegister(deal).open;
+    const dueDate = open.length ? open[0].date : null;
+    plans.push({
+      deal, remaining,
+      qty: deal.kind === 'sale' ? -remaining : remaining,
+      dueDate, overdue: dueDate ? dueDate < today : false,
+      scheduled: !!dueDate,
+    });
+  }
+  return plans;
+}
+
+/* Сводка по складу: остатки, прогноз, маркеры дефицита и залежалости */
+function computeItemsOutlook(horizon = 30) {
+  const today = todayISO();
+  const rows = [];
+  for (const item of state.items) {
+    const moves = itemMovements(item.id);
+    const qtyToday = (item.qtyOpening || 0) + sum(moves.map((m) => m.qty));
+    const plans = itemPlanMoves(item.id, today);
+
+    // прогноз: продажи (оттоки) — просроченные на сегодня; закупки (притоки) —
+    // просроченные не учитываем (консервативно, как в денежном прогнозе)
+    const events = [];
+    const atRiskQty = [];
+    for (const p of plans) {
+      if (!p.scheduled) continue;
+      if (p.qty < 0) events.push({ date: p.overdue ? today : p.dueDate, qty: p.qty, deal: p.deal });
+      else if (p.overdue) atRiskQty.push(p);
+      else events.push({ date: p.dueDate, qty: p.qty, deal: p.deal });
+    }
+    let q = qtyToday, minQty = qtyToday, minDate = today;
+    for (let i = 0; i <= horizon; i++) {
+      const d = addDays(today, i);
+      q += sum(events.filter((e) => e.date === d).map((e) => e.qty));
+      if (q < minQty) { minQty = q; minDate = d; }
+    }
+
+    const lastMove = moves.length ? moves[moves.length - 1].date : null;
+    const staleDays = item.staleDays || 0;
+    // возраст без движения: от последнего движения либо от создания позиции —
+    // свежая карточка с начальным остатком не считается залежалой в день создания
+    const baseDate = lastMove || item.createdAt || today;
+    const idleDays = diffDays(today, baseDate);
+    const stale = staleDays > 0 && qtyToday > 0.004 && idleDays >= staleDays;
+    const unscheduled = plans.filter((p) => !p.scheduled);
+
+    rows.push({
+      item, qtyToday,
+      valueToday: qtyToday * (item.price || 0),
+      minQty, minDate,
+      deficit: minQty < -0.004,
+      stale, idleDays,
+      frozenValue: stale ? qtyToday * (item.price || 0) : 0,
+      atRiskQty, unscheduled,
+    });
+  }
+  return {
+    rows,
+    deficitCount: rows.filter((r) => r.deficit).length,
+    staleCount: rows.filter((r) => r.stale).length,
+    frozenTotal: sum(rows.map((r) => r.frozenValue)),
+  };
+}
+
+/* Приоритет планового оттока для платёжного календаря.
+   У прочих платежей приоритет собственный (по категории), у сделок — по сроку. */
+function outflowPriority(date, today, prioKey) {
+  if (prioKey && PRIORITIES[prioKey]) return PRIORITIES[prioKey];
+  if (date < today) return PRIORITIES.critical;
+  if (diffDays(date, today) <= 7) return PRIORITIES.primary;
+  return PRIORITIES.flexible;
 }
 
 /* =====================================================================
@@ -482,6 +811,7 @@ const ROUTES = {
   payments: { title: 'Платёжные документы', render: renderPayments },
   waybills: { title: 'Накладные', render: renderWaybills },
   tmc: { title: 'График ТМЦ', render: renderTmc },
+  stock: { title: 'Склад и номенклатура', render: renderStock },
   cashflow: { title: 'CashFlow-календарь', render: renderCashflow },
   matrix: { title: 'Матрица ресурсов', render: renderMatrix },
   journal: { title: 'Журнал проведения', render: renderJournal },
@@ -537,13 +867,16 @@ function renderDashboard(flags) {
   const reds = flags.filter((f) => f.severity === 'red');
   const proj = computeProjection(30);
   const mx = liquidityMatrix();
+  const stockOutlook = computeItemsOutlook(30);
 
-  /* Счётчик красных маркеров: флаги + кассовый разрыв + дефицит ТМЦ */
-  const markerCount = reds.length + (proj.firstGap ? 1 : 0) + (proj.firstDeficit ? 1 : 0);
+  /* Счётчик красных маркеров: флаги + кассовый разрыв + дефицит ТМЦ + дефициты позиций */
+  const markerCount = reds.length + (proj.firstGap ? 1 : 0) + (proj.firstDeficit ? 1 : 0) + stockOutlook.deficitCount;
   const markerSubs = [];
   if (proj.firstGap) markerSubs.push(`кассовый разрыв ${fmtDate(proj.firstGap.date)} (через ${diffDays(proj.firstGap.date, today)} дн.)`);
   if (proj.firstDeficit) markerSubs.push(`дефицит ТМЦ ${fmtDate(proj.firstDeficit.date)}`);
+  if (stockOutlook.deficitCount) markerSubs.push(`дефицит по ${stockOutlook.deficitCount} поз. склада`);
   if (reds.length) markerSubs.push(`просрочек: ${reds.length}`);
+  if (stockOutlook.staleCount) markerSubs.push(`заморожено ${fmtMoney(stockOutlook.frozenTotal)} (${stockOutlook.staleCount} залежалых поз.)`);
 
   const counterHTML = `
   <div class="marker-hero ${markerCount ? 'alert' : 'calm'}">
@@ -604,24 +937,61 @@ function renderDashboard(flags) {
     <span>«Мы должны» — КЗ поставщикам и обязательства по отгрузке за предоплаты</span>
   </div></div>`;
 
-  /* Прогноз по дням будущего */
-  const eventDays = proj.days.filter((d) => d.events.length || d.cashGap || d.deficit);
+  /* Симулятор «Что если?»: активное моделирование либо готовые решения.
+     Таблица, график и atRisk ниже строятся из одного прогноза (shownProj) —
+     в режиме моделирования всё показывает сценарий. */
+  let simHTML = '';
+  const simProj = simulation ? computeProjection(30, simulation) : null;
+  const shownProj = simProj || proj;
+
+  const eventDays = shownProj.days.filter((d) => d.events.length || d.cashGap || d.deficit);
   const projRows = eventDays.slice(0, 12).map((d) => `
     <tr>
       <td class="num">${fmtDate(d.date)}</td>
-      <td>${d.events.map((e) => `<div class="cell-sub">${e.cash > 0 || e.stock > 0 ? '+' : '−'} ${esc(e.label)}${e.overdue ? ' <span class="badge badge-red">просрочено → сегодня</span>' : ''}</div>`).join('') || '<span class="cell-sub">—</span>'}</td>
+      <td>${d.events.map((e) => `<div class="cell-sub">${e.cash > 0 || e.stock > 0 ? '+' : '−'} ${esc(e.label)}${e.sim ? ' <span class="badge badge-amber">сценарий</span>' : ''}${e.overdue ? ' <span class="badge badge-red">просрочено → сегодня</span>' : ''}</div>`).join('') || '<span class="cell-sub">—</span>'}</td>
       <td class="num ${d.cashGap ? 'neg-cell' : ''}">${fmtMoney(d.cash)}${d.cashGap ? ' ⚑' : ''}</td>
       <td class="num ${d.deficit ? 'neg-cell' : ''}">${fmtMoney(d.stock)}${d.deficit ? ' ⚑' : ''}</td>
     </tr>`).join('');
 
-  const atRiskHTML = proj.atRisk.length
-    ? `<div class="callout callout-grey" style="margin-top:12px">Вне прогноза (просроченные притоки, на них нельзя рассчитывать): ${proj.atRisk.map((r) =>
+  const atRiskHTML = shownProj.atRisk.length
+    ? `<div class="callout callout-grey" style="margin-top:12px">Вне прогноза (просроченные притоки, на них нельзя рассчитывать): ${shownProj.atRisk.map((r) =>
         esc(`${r.kind === 'money' ? 'оплата' : 'поставка'} ${fmtMoney(r.amount)} от ${r.deal.counterparty} (ждали ${fmtDate(r.date)})`)).join('; ')}.</div>`
     : '';
 
+  if (simulation && simProj) {
+    const before = proj.firstGap ? `разрыв ${fmtDate(proj.firstGap.date)} (${fmtMoney(proj.firstGap.cash)})` : 'разрыва нет';
+    const after = simProj.firstGap ? `разрыв ${fmtDate(simProj.firstGap.date)} (${fmtMoney(simProj.firstGap.cash)})` : 'разрыва нет';
+    simHTML = `
+    <div class="sim-banner">
+      <div class="sim-banner-head">Режим моделирования: ${esc(simulation.label || 'сценарий')}</div>
+      <div class="sim-banner-body">Было: ${esc(before)} → Станет: <b>${esc(after)}</b>. График ниже показывает сценарий (данные не изменены).</div>
+      <div class="sim-banner-actions">
+        <button class="btn btn-primary btn-sm" data-action="sim-apply">Утвердить сценарий</button>
+        <button class="btn btn-outline btn-sm" data-action="sim-reset">Сбросить</button>
+      </div>
+    </div>`;
+  } else if (proj.firstGap) {
+    lastSolutions = generateSolutions(proj, 30);
+    if (lastSolutions.length) {
+      simHTML = `
+      <div class="solutions">
+        <div class="solutions-title">Готовые решения — симулятор «Что если?»</div>
+        ${lastSolutions.map((s, i) => `
+          <div class="solution-row">
+            <div class="solution-body">
+              <div class="solution-name">${esc(s.title)}</div>
+              <div class="solution-effect">${esc(s.effect)}</div>
+            </div>
+            <button class="btn btn-outline btn-sm" data-action="simulate" data-idx="${i}">Смоделировать</button>
+          </div>`).join('')}
+      </div>`;
+    }
+  }
+
   const projHTML = `
-  <div class="card">${cardTitle('chart', 'Прогноз остатков на 30 дней', 'эффект домино: каждый проведённый документ пересчитывает график')}
-    ${svgProjection(proj)}
+  <div class="card">${cardTitle('chart', 'Прогноз остатков на 30 дней', simulation ? 'сценарий моделирования' : 'эффект домино: каждый проведённый документ пересчитывает график')}
+    ${svgProjection(shownProj)}
+    ${simHTML}
     ${eventDays.length ? `<div class="table-wrap" style="margin-top:14px"><table>
       <thead><tr><th class="num">Дата</th><th>События дня</th><th class="num">ДС на конец дня</th><th class="num">ТМЦ на конец дня</th></tr></thead>
       <tbody>${projRows}</tbody>
@@ -716,8 +1086,8 @@ function flagItemHTML(f) {
 
 function calEventHTML(e, today, withPriority) {
   const overdue = e.plan && e.date < today;
-  // приоритет ранжирует только оттоки (докс: критичные / первоочередные / гибкие)
-  const prio = withPriority && e.plan && e.dir === 'out' ? outflowPriority(e.date, today) : null;
+  // приоритет ранжирует только оттоки (докс: критичные / первоочередные / гибкие / дискреционные)
+  const prio = withPriority && e.plan && e.dir === 'out' ? outflowPriority(e.date, today, e.prio) : null;
   return `<div class="cal-event ${e.dir} ${overdue ? 'overdue' : ''}">
     <span class="badge ${e.plan ? (overdue ? 'badge-red' : 'badge-blue') : 'badge-grey'}">${overdue ? 'просрочено' : e.plan ? 'план' : 'факт'}</span>
     ${prio ? `<span class="badge ${prio.cls}">${prio.label}</span>` : ''}
@@ -762,6 +1132,198 @@ function openBalancesForm() {
       ]);
     });
   });
+}
+
+/* Форма позиции номенклатуры */
+function openItemForm(id) {
+  const it = id ? itemById(id) : null;
+  openModal(it ? 'Позиция ' + it.sku : 'Новая позиция номенклатуры', `
+    <form id="frm" class="form-grid">
+      <div class="field"><label>Артикул <span class="req">*</span></label>
+        <input name="sku" required value="${it ? esc(it.sku) : ''}" placeholder="АРТ-001"></div>
+      <div class="field"><label>Наименование <span class="req">*</span></label>
+        <input name="name" required value="${it ? esc(it.name) : ''}" placeholder="Секции ограждений"></div>
+      <div class="field"><label>Единица измерения</label>
+        <input name="unit" value="${it ? esc(it.unit) : 'шт'}"></div>
+      <div class="field"><label>Учётная цена, ₽</label>
+        <input name="price" type="number" min="0" step="0.01" value="${it ? it.price : ''}">
+        <div class="note">Для оценки стоимости остатка и «замороженных» денег.</div></div>
+      <div class="field"><label>Начальный остаток (кол-во)</label>
+        <input name="qtyOpening" type="number" min="0" step="0.001" value="${it ? it.qtyOpening : 0}">
+        <div class="note">Остаток на момент начала учёта — из инвентаризации. Не может быть отрицательным.</div></div>
+      <div class="field"><label>Норматив залежалости, дней</label>
+        <input name="staleDays" type="number" min="0" step="1" value="${it ? it.staleDays : 30}">
+        <div class="note">Нет движения дольше — позиция подсвечивается как «замороженные деньги». 0 — не контролировать.</div></div>
+      <div class="form-actions full">
+        <button type="button" class="btn btn-outline" data-close>Отмена</button>
+        <button type="submit" class="btn btn-primary">${it ? 'Сохранить' : 'Создать позицию'}</button>
+      </div>
+    </form>`, (body) => {
+    body.querySelector('#frm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const f = new FormData(e.target);
+      const sku = f.get('sku').trim(), name = f.get('name').trim();
+      if (!sku || !name) { showToast('Заполните артикул и наименование', ['Пробелы не считаются'], 'red'); return; }
+      if (state.items.some((x) => x.sku === sku && x.id !== (it ? it.id : ''))) {
+        showToast('Артикул уже занят', [sku], 'red'); return;
+      }
+      const rec = it || { id: uuid(), createdAt: todayISO() };
+      rec.sku = sku; rec.name = name;
+      rec.unit = f.get('unit').trim() || 'шт';
+      rec.price = Math.max(0, parseFloat(f.get('price')) || 0);
+      rec.qtyOpening = Math.max(0, parseFloat(f.get('qtyOpening')) || 0);
+      rec.staleDays = Math.max(0, parseInt(f.get('staleDays'), 10) || 0);
+      if (!it) state.items.push(rec);
+      save(); closeModal(true); render();
+      showToast(it ? 'Позиция обновлена' : 'Позиция создана', [`${rec.sku} · ${rec.name}`]);
+    });
+  });
+}
+
+/* Форма прочего платежа (вне сделок) */
+function openOtherForm(id) {
+  const p = id ? state.otherPayments.find((x) => x.id === id) : null;
+  const catOptions = Object.entries(OTHER_CATEGORIES).map(([k, c]) =>
+    `<option value="${k}" ${p && p.category === k ? 'selected' : ''}>${c.label}</option>`).join('');
+  const prioOptions = Object.entries(PRIORITIES).map(([k, c]) =>
+    `<option value="${k}" ${p && p.priority === k ? 'selected' : ''}>${c.label}</option>`).join('');
+  openModal(p ? 'Платёж «' + p.name + '»' : 'Новый прочий платёж', `
+    <form id="frm" class="form-grid">
+      <div class="field full"><label>Название <span class="req">*</span></label>
+        <input name="name" required value="${p ? esc(p.name) : ''}" placeholder="Аренда склада"></div>
+      <div class="field"><label>Категория</label>
+        <select name="category" id="fCat">${catOptions}</select>
+        <div class="note" id="fCatNote">Приоритет подставляется по категории, его можно изменить.</div></div>
+      <div class="field"><label>Приоритет</label>
+        <select name="priority" id="fPrio">${prioOptions}</select>
+        <div class="note">Дискреционные расходы симулятор предложит отменить при риске разрыва.</div></div>
+      <div class="field"><label>Сумма, ₽ <span class="req">*</span></label>
+        <input name="amount" type="number" min="0.01" step="0.01" required value="${p ? p.amount : ''}"></div>
+      <div class="field"><label>Дата платежа <span class="req">*</span></label>
+        <input name="date" type="date" required value="${p ? p.date : todayISO()}"></div>
+      <div class="field full"><label>Повторение</label>
+        <select name="recurring">
+          <option value="none" ${!p || p.recurring !== 'monthly' ? 'selected' : ''}>Разовый</option>
+          <option value="monthly" ${p && p.recurring === 'monthly' ? 'selected' : ''}>Ежемесячно</option>
+        </select>
+        <div class="note">Ежемесячно: прошедшие вхождения считаются исполненными. Неоплаченный прошлый период оформите отдельным разовым платежом — он попадёт в прогноз как просроченный.</div></div>
+      <div class="form-actions full">
+        <button type="button" class="btn btn-outline" data-close>Отмена</button>
+        <button type="submit" class="btn btn-primary">${p ? 'Сохранить' : 'Добавить платёж'}</button>
+      </div>
+    </form>`, (body) => {
+    const fCat = body.querySelector('#fCat');
+    const fPrio = body.querySelector('#fPrio');
+    if (!p) fPrio.value = OTHER_CATEGORIES[fCat.value].prio;
+    fCat.addEventListener('change', () => { fPrio.value = OTHER_CATEGORIES[fCat.value].prio; });
+    body.querySelector('#frm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const f = new FormData(e.target);
+      const name = f.get('name').trim();
+      const amount = parseFloat(f.get('amount')) || 0;
+      if (!name || amount <= 0) { showToast('Заполните название и сумму', [], 'red'); return; }
+      const rec = p || { id: uuid(), done: false };
+      rec.name = name;
+      rec.category = f.get('category');
+      rec.priority = f.get('priority');
+      rec.amount = amount;
+      rec.date = f.get('date');
+      rec.recurring = f.get('recurring');
+      if (!p) state.otherPayments.push(rec);
+      save(); closeModal(true); render();
+      showToast(p ? 'Платёж обновлён' : 'Платёж добавлен в график',
+        [`${rec.name} · ${fmtMoney(rec.amount)}${rec.recurring === 'monthly' ? '/мес' : ''} · ${PRIORITIES[rec.priority].label}`]);
+    });
+  });
+}
+
+/* =====================================================================
+   Редактор строк спецификации (позиция × кол-во × цена) для сделок и накладных
+   ===================================================================== */
+
+function itemOptions(selectedId) {
+  return '<option value="">— позиция —</option>' + state.items.map((i) =>
+    `<option value="${esc(i.id)}" ${i.id === selectedId ? 'selected' : ''}>${esc(i.sku + ' · ' + i.name)}</option>`).join('');
+}
+
+function linesEditorHTML(lines) {
+  const rows = (lines || []).map((l) => lineRowHTML(l)).join('');
+  if (!state.items.length) {
+    return `<div class="field full"><label>Спецификация по позициям</label>
+      <div class="note">Номенклатуры пока нет — создайте позиции в разделе «Склад и номенклатура», чтобы вести поартикульный учёт. Без спецификации документ работает по сумме.</div></div>`;
+  }
+  return `<div class="field full"><label>Спецификация по позициям</label>
+    <div id="linesBox">${rows}</div>
+    <button type="button" class="btn btn-outline btn-sm" id="addLine" style="margin-top:6px">+ позиция</button>
+    <div class="note" id="linesNote">Со спецификацией сумма документа считается по строкам; без неё — вводится вручную.</div>
+  </div>`;
+}
+
+function lineRowHTML(l) {
+  return `<div class="line-row">
+    <select class="l-item">${itemOptions(l ? l.itemId : '')}</select>
+    <input class="l-qty" type="number" step="0.001" min="0" placeholder="кол-во" value="${l ? l.qty : ''}">
+    <input class="l-price" type="number" step="0.01" min="0" placeholder="цена" value="${l ? l.price : ''}">
+    <span class="l-sum">—</span>
+    <button type="button" class="l-del" title="Убрать строку">✕</button>
+  </div>`;
+}
+
+/* Монтирует обработчики редактора строк; totalInput — поле «Сумма» документа */
+function mountLinesEditor(body, totalInput) {
+  const box = body.querySelector('#linesBox');
+  if (!box) return { getLines: () => [] };
+
+  const recalc = () => {
+    let total = 0, any = false;
+    box.querySelectorAll('.line-row').forEach((row) => {
+      const qty = parseFloat(row.querySelector('.l-qty').value) || 0;
+      const price = parseFloat(row.querySelector('.l-price').value) || 0;
+      const ok = row.querySelector('.l-item').value && qty > 0;
+      const s = qty * price;
+      row.querySelector('.l-sum').textContent = ok ? fmtMoney(s) : '—';
+      if (ok) { total += s; any = true; }
+    });
+    if (any) {
+      totalInput.value = total.toFixed(2);
+      totalInput.readOnly = true;
+    } else {
+      totalInput.readOnly = false;
+    }
+  };
+
+  box.addEventListener('input', recalc);
+  box.addEventListener('change', (e) => {
+    // при выборе позиции подставляем учётную цену, если цена ещё не задана
+    if (e.target.classList.contains('l-item')) {
+      const row = e.target.closest('.line-row');
+      const item = itemById(e.target.value);
+      const priceEl = row.querySelector('.l-price');
+      if (item && !parseFloat(priceEl.value)) priceEl.value = item.price || '';
+    }
+    recalc();
+  });
+  box.addEventListener('click', (e) => {
+    if (e.target.classList.contains('l-del')) { e.target.closest('.line-row').remove(); modalDirty = true; recalc(); }
+  });
+  body.querySelector('#addLine').addEventListener('click', () => {
+    box.insertAdjacentHTML('beforeend', lineRowHTML(null));
+    modalDirty = true;
+  });
+  recalc();
+
+  return {
+    getLines: () => {
+      const out = [];
+      box.querySelectorAll('.line-row').forEach((row) => {
+        const itemId = row.querySelector('.l-item').value;
+        const qty = parseFloat(row.querySelector('.l-qty').value) || 0;
+        const price = parseFloat(row.querySelector('.l-price').value) || 0;
+        if (itemId && itemById(itemId) && qty > 0) out.push({ itemId, qty, price });
+      });
+      return out;
+    },
+  };
 }
 
 /* ---------- Сделки ---------- */
@@ -864,6 +1426,79 @@ function renderWaybills() {
     <tbody>${rows}</tbody></table>`
     : emptyBlock('box', 'Накладных нет', state.deals.length ? 'Создайте накладную по сделке.' : 'Сначала создайте сделку — накладная привязывается через ID_Deal.')}
   </div></div>`;
+}
+
+/* ---------- Склад и номенклатура ---------- */
+function renderStock() {
+  const today = todayISO();
+  const outlook = computeItemsOutlook(30);
+
+  const rows = outlook.rows.map((r) => {
+    const marker = r.deficit
+      ? `<span class="badge badge-red">дефицит ${fmtDate(r.minDate)}: ${r.minQty % 1 ? r.minQty.toFixed(1) : r.minQty} ${esc(r.item.unit)}</span>`
+      : r.stale
+        ? `<span class="badge badge-amber">залежалый · заморожено ${fmtMoney(r.frozenValue)}</span>`
+        : '<span class="badge badge-green">норма</span>';
+    const extra = [];
+    if (r.atRiskQty.length) extra.push(`ожидание просроченных поставок: ${r.atRiskQty.map((p) => `${p.remaining} ${esc(r.item.unit)} (${esc(p.deal.counterparty)})`).join(', ')}`);
+    if (r.unscheduled.length) extra.push(`обязательства без плановой даты: ${r.unscheduled.map((p) => `${p.remaining} ${esc(r.item.unit)}`).join(', ')}`);
+    return `<tr>
+      <td><div class="cell-main">${esc(r.item.sku)}</div><div class="cell-sub">${esc(r.item.name)}</div></td>
+      <td class="num">${fmtMoney(r.item.price)}</td>
+      <td class="num ${r.qtyToday < 0 ? 'neg-cell' : ''}">${r.qtyToday % 1 ? r.qtyToday.toFixed(1) : r.qtyToday} ${esc(r.item.unit)}</td>
+      <td class="num">${fmtMoney(r.valueToday)}</td>
+      <td class="num ${r.minQty < 0 ? 'neg-cell' : ''}">${r.minQty % 1 ? r.minQty.toFixed(1) : r.minQty} ${esc(r.item.unit)} · ${fmtDate(r.minDate)}</td>
+      <td>${marker}${extra.length ? `<div class="cell-sub" style="margin-top:3px">${extra.join('; ')}</div>` : ''}</td>
+      <td><div class="row-actions">
+        <button class="btn btn-outline btn-sm" data-action="edit-item" data-id="${esc(r.item.id)}">Изменить</button>
+        <button class="btn btn-outline btn-sm" data-action="del-item" data-id="${esc(r.item.id)}">Удалить</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+
+  const itemsCard = `<div class="card">
+    ${cardTitle('box', 'Остатки по позициям', 'дефицит и залежалость — по каждому артикулу')}
+    <div class="table-wrap">
+    ${outlook.rows.length ? `<table>
+      <thead><tr><th>Артикул</th><th class="num">Учётная цена</th><th class="num">Остаток</th><th class="num">Стоимость</th><th class="num">Мин. за 30 дн</th><th>Маркер</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>`
+      : emptyBlock('box', 'Номенклатуры нет', 'Создайте позиции — тогда сделки и накладные смогут вести поартикульный учёт, а система будет считать дефицит и залежалость по каждому артикулу.')}
+    </div>
+    <div style="margin-top:14px"><button class="btn btn-primary" data-action="new-item">+ Новая позиция</button></div>
+  </div>`;
+
+  const others = [...state.otherPayments].sort((a, b) => a.date.localeCompare(b.date));
+  const otherRows = others.map((p) => {
+    const cat = OTHER_CATEGORIES[p.category] || OTHER_CATEGORIES.other;
+    const prio = PRIORITIES[p.priority] || PRIORITIES.flexible;
+    return `<tr class="${p.done ? 'row-done' : ''}">
+      <td><div class="cell-main">${esc(p.name)}</div><div class="cell-sub">${cat.label}${p.recurring === 'monthly' ? ' · ежемесячно' : ''}</div></td>
+      <td class="num">${fmtMoney(p.amount)}</td>
+      <td class="num">${fmtDate(p.date)}</td>
+      <td><span class="badge ${prio.cls}">${prio.label}</span></td>
+      <td>${p.done ? '<span class="badge badge-grey">исполнен / отменён</span>' : '<span class="badge badge-blue">в графике</span>'}</td>
+      <td><div class="row-actions">
+        <button class="btn btn-outline btn-sm" data-action="toggle-other-done" data-id="${esc(p.id)}">${p.done ? 'Вернуть в график' : 'Исполнен'}</button>
+        <button class="btn btn-outline btn-sm" data-action="edit-other" data-id="${esc(p.id)}">Изменить</button>
+        <button class="btn btn-outline btn-sm" data-action="del-other" data-id="${esc(p.id)}">Удалить</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+
+  const othersCard = `<div class="card">
+    ${cardTitle('banknote', 'Прочие платежи', 'аренда, налоги, зарплата — вне сделок; входят в прогноз и календарь')}
+    <div class="table-wrap">
+    ${others.length ? `<table>
+      <thead><tr><th>Платёж</th><th class="num">Сумма</th><th class="num">Дата</th><th>Приоритет</th><th>Статус</th><th></th></tr></thead>
+      <tbody>${otherRows}</tbody></table>`
+      : emptyBlock('banknote', 'Прочих платежей нет', 'Добавьте регулярные обязательства — налоги, зарплату, аренду. Они попадут в платёжный календарь с приоритетами и в прогноз кассовых разрывов.')}
+    </div>
+    <div style="margin-top:14px"><button class="btn btn-primary" data-action="new-other">+ Новый платёж</button></div>
+  </div>`;
+
+  return `<div class="page-head"><div class="desc">Складской контур в натуральном выражении: остатки по каждому артикулу, прогноз минимума на 30 дней, маркеры дефицита и сверхнормативных (залежалых) остатков, «съедающих» оборотный капитал. Здесь же — прочие платежи вне сделок для полного платёжного календаря.</div></div>
+  ${itemsCard}
+  ${othersCard}`;
 }
 
 /* ---------- График ТМЦ ---------- */
@@ -979,15 +1614,43 @@ function renderCashflow() {
       <div class="cal-date">${fmtDate(date)}
         ${overdue ? '<span class="badge badge-red">просрочено</span>' : diffDays(date, today) <= 7 ? '<span class="badge badge-amber">скоро</span>' : ''}
       </div>
-      ${byDate[date].map((e) => calEventHTML(e, today)).join('')}
+      ${byDate[date].map((e) => calEventHTML(e, today, true)).join('')}
     </div>`;
   }).join('') || '<p style="color:var(--muted);font-size:13px">Открытых плановых обязательств нет — все накладные оплачены.</p>';
 
   const facts = events.filter((e) => !e.plan);
   const factsHTML = facts.length ? [...facts].reverse().map((e) => calEventHTML(e, today)).join('') : '<p style="color:var(--muted);font-size:13px">Фактов оплат нет.</p>';
 
+  /* Выручка в двух разрезах: по отгрузке (P&L) и по деньгам (Cash Flow) —
+     без путаницы и ложных иллюзий о прибыльности */
+  let revShipped = 0, revReceived = 0, revPlanned = 0;
+  for (const w of state.waybills) {
+    if (w.posted && w.isReal && w.kind === 'out') revShipped += w.amount;
+  }
+  for (const p of state.payments) {
+    if (p.posted && p.kind === 'in') revReceived += p.amount;
+  }
+  for (const deal of state.deals.filter((d) => d.kind === 'sale')) {
+    revPlanned += sum(moneyRegister(deal).open.map((o) => o.left));
+  }
+  const revHTML = `
+  <div class="card">${cardTitle('banknote', 'Выручка в двух разрезах', 'по отгрузке (P&L) и по деньгам (Cash Flow)')}
+    <div class="rev-grid">
+      <div class="rev-cell"><div class="rev-label">Начислено по отгрузке (P&L)</div>
+        <div class="rev-value">${fmtMoney(revShipped)}</div>
+        <div class="rev-sub">реальные расходные накладные</div></div>
+      <div class="rev-cell"><div class="rev-label">Поступило денег (Cash Flow)</div>
+        <div class="rev-value">${fmtMoney(revReceived)}</div>
+        <div class="rev-sub">входящие платёжки</div></div>
+      <div class="rev-cell"><div class="rev-label">Начислено, но не оплачено</div>
+        <div class="rev-value ${revPlanned ? 'neg-cell' : ''}">${fmtMoney(revPlanned)}</div>
+        <div class="rev-sub">дебиторка: прибыль на бумаге — не деньги</div></div>
+    </div>
+  </div>`;
+
   return `<div class="page-head"><div class="desc">Денежный след: факты из платёжек (Date_Payment_Execution) и плановые дедлайны из реальных накладных (Date_Payment_Execution_Plan). Система строит календарь выплат кредиторам и напоминаний дебиторам.</div></div>
   <div class="card">${cardTitle('chart', 'Кумулятивный денежный поток', 'сплошная — факт, пунктир — прогноз с учётом плана')}${cashflowSVG(factPts, planPts, today, anchor)}</div>
+  ${revHTML}
   <div class="two-col">
     <div class="card">${cardTitle('calendar', 'Календарь плановых платежей')}${calendar}</div>
     <div class="card">${cardTitle('check', 'Факты оплат')}${factsHTML}</div>
@@ -1177,9 +1840,19 @@ function renderHelp() {
       <li><b>Матрица баланса</b> по двум контурам (деньги и ТМЦ): <i>У нас есть</i> — живой остаток на счетах и фактический запас склада; <i>Нам должны</i> — подтверждённая ДЗ и оплаченные недошедшие поставки; <i>Мы должны</i> — КЗ поставщикам и обязательства по отгрузке за предоплаты; <i>НАДО</i> — фокус внимания: <code>Надо = Мы должны − (Живой остаток + Нам должны)</code>.</li>
       <li><b>Прогноз остатков по дням.</b> На каждый день будущего система считает остаток ДС и склада: маркер кассового разрыва — остаток к концу дня &lt; 0; маркер дефицита — склад &lt; 0. Разрыв виден за недели до наступления. Консервативный сценарий: на просроченные притоки система не рассчитывает.</li>
       <li><b>«Эффект домино».</b> Любой проведённый документ «сегодня» мгновенно пересчитывает весь плановый горизонт — регистры выводятся из документов, а не хранятся отдельно.</li>
-      <li><b>Платёжный календарь с приоритетами</b> оттоков: критичный (просрочен) → первоочередной (ближайшие 7 дней) → гибкий.</li>
+      <li><b>Платёжный календарь с приоритетами</b> оттоков: критичный (налоги, зарплата, просрочки) → первоочередной → гибкий → дискреционный (можно отказаться при риске разрыва).</li>
+      <li><b>Симулятор «Что если?»</b> — при риске кассового разрыва система сама генерирует варианты решений: сдвиг платежа, запрос досрочной предоплаты у дебитора, отказ от дискреционного расхода. Вариант можно смоделировать на графике, оценить влияние и утвердить — плановые даты скорректируются с записью в журнал.</li>
       <li><b>Живые остатки</b> ДС и склада задаются вручную (из выписки и инвентаризации) или считаются из проведённых документов.</li>
     </ul>
+
+    <h2>5. Склад, номенклатура и прочие платежи</h2>
+    <ul>
+      <li><b>Поартикульный учёт.</b> Справочник номенклатуры; сделки и накладные ведут спецификацию позиций (кол-во × цена). Остаток каждого артикула считается в натуре по реальным проведённым накладным.</li>
+      <li><b>Маркер дефицита</b> — по каждому артикулу строится прогноз остатка на 30 дней с учётом обязательств по отгрузке и ожидаемых поставок; уход в минус подсвечивается красным и попадает в счётчик маркеров.</li>
+      <li><b>Залежалые остатки</b> — позиции без движения дольше норматива подсвечиваются как «замороженные» деньги, съедающие оборотный капитал.</li>
+      <li><b>Прочие платежи</b> — аренда, налоги, зарплата и другие обязательства вне сделок, разовые и ежемесячные. Входят в матрицу «Мы должны», прогноз разрывов и платёжный календарь со своим приоритетом.</li>
+    </ul>
+    <div class="callout callout-grey">Этап 2 (бэкенд): интеграция с банком (выписки) и ЭДО (первичка), совместная работа ролей — снабженец, продавец, бухгалтер — с общей базой.</div>
     <div class="callout callout-grey">Данные хранятся локально в браузере (localStorage). «Экспорт» выгружает всё в JSON, «Импорт» — восстанавливает.</div>
   </div>`;
 }
@@ -1207,9 +1880,10 @@ function openDealForm(id) {
           <option value="purchase" ${d && d.kind === 'purchase' ? 'selected' : ''}>Закупка (нам поставляют)</option>
         </select></div>
       <div class="field"><label>Сумма сделки, ₽ <span class="req">*</span></label>
-        <input name="amount" type="number" min="1" step="0.01" required value="${d ? d.amount : ''}"></div>
+        <input name="amount" id="fDealAmount" type="number" min="1" step="0.01" required value="${d ? d.amount : ''}"></div>
       <div class="field"><label>ID_Deal (UUID)</label>
         <input readonly value="${d ? esc(d.id) : 'будет сгенерирован автоматически'}"></div>
+      ${linesEditorHTML(d ? d.lines : null)}
       <div class="field"><label>Срок перемещения ТМЦ после оплаты, дней</label>
         <input name="shipDays" type="number" min="0" step="1" value="${d ? d.shipDays : 5}">
         <div class="note">Юридический блок: «отгрузить/поставить в течение N дней после оплаты». Из него считается Date_Material_Execution_Plan платёжек.</div></div>
@@ -1223,17 +1897,25 @@ function openDealForm(id) {
         <button type="submit" class="btn btn-primary">${d ? 'Сохранить' : 'Создать сделку'}</button>
       </div>
     </form>`, (body) => {
+    const linesEd = mountLinesEditor(body, body.querySelector('#fDealAmount'));
     body.querySelector('#frm').addEventListener('submit', (e) => {
       e.preventDefault();
       const f = new FormData(e.target);
       const name = f.get('name').trim();
       const counterparty = f.get('counterparty').trim();
       if (!name || !counterparty) { showToast('Заполните наименование и контрагента', ['Пробелы не считаются'], 'red'); return; }
+      // все проверки — до мутации rec, чтобы отклонённая правка не портила сделку
+      const lines = linesEd.getLines();
+      const amount = lines.length
+        ? sum(lines.map((l) => l.qty * l.price))
+        : Math.max(0, parseFloat(f.get('amount')) || 0);
+      if (amount <= 0) { showToast('Сумма сделки должна быть больше нуля', ['Проверьте строки спецификации: нужны позиция, количество и цена больше нуля'], 'red'); return; }
       const rec = d || { id: uuid() };
       rec.name = name;
       rec.counterparty = counterparty;
       rec.kind = f.get('kind');
-      rec.amount = Math.max(0, parseFloat(f.get('amount')) || 0);
+      rec.lines = lines;
+      rec.amount = amount;
       rec.shipDays = Math.max(0, parseInt(f.get('shipDays'), 10) || 0);
       rec.deferDays = Math.max(0, parseInt(f.get('deferDays'), 10) || 0);
       rec.comment = f.get('comment').trim();
@@ -1307,14 +1989,15 @@ function openPaymentForm(id) {
       if (state.payments.some((x) => x.num === num && x.id !== rec.id)) {
         showToast('Номер уже занят', [`Платёжный документ ${num} существует — укажите другой номер`], 'red'); return;
       }
+      const amount = parseFloat(f.get('amount')) || 0;
+      if (amount <= 0) { showToast('Сумма должна быть больше нуля', [], 'red'); return; }
       rec.num = num;
       rec.dealId = deal.id;
       rec.kind = DEAL_KIND[deal.kind].payKind;
-      rec.amount = parseFloat(f.get('amount')) || 0;
+      rec.amount = amount;
       rec.datePaymentExecution = f.get('datePaymentExecution');
       rec.dateMaterialPlan = f.get('dateMaterialPlan') || addDays(rec.datePaymentExecution, deal.shipDays);
       rec.comment = f.get('comment').trim();
-      if (rec.amount <= 0) return;
       if (!p) state.payments.push(rec);
       save(); closeModal(true); render();
       showToast(p ? 'Платёжный документ обновлён' : 'Платёжный документ создан',
@@ -1336,9 +2019,10 @@ function openWaybillForm(id) {
         <select name="dealId" id="fDeal">${dealOptions(defaults.dealId)}</select>
         <div class="note" id="fKindNote"></div></div>
       <div class="field"><label>Сумма ТМЦ, ₽ <span class="req">*</span></label>
-        <input name="amount" type="number" min="0.01" step="0.01" required value="${defaults.amount}"></div>
-      <div class="field"><label>Состав ТМЦ</label>
+        <input name="amount" id="fWbAmount" type="number" min="0.01" step="0.01" required value="${defaults.amount}"></div>
+      <div class="field"><label>Состав ТМЦ (текстом)</label>
         <input name="goods" value="${esc(defaults.goods || '')}" placeholder="металлопрокат, 12 т"></div>
+      ${linesEditorHTML(w ? w.lines : null)}
       <div class="field"><label>Date_Material_Execution_Fact — факт перемещения <span class="req">*</span></label>
         <input name="dateMaterialFact" id="fFactDate" type="date" required max="${todayISO()}" value="${defaults.dateMaterialFact}">
         <div class="note">Дата фактического отпуска со склада или приёмки МОЛ. Факт не может быть в будущем.</div></div>
@@ -1366,6 +2050,7 @@ function openWaybillForm(id) {
     const note = body.querySelector('#fPayPlanNote');
     const kindNote = body.querySelector('#fKindNote');
     const realNote = body.querySelector('#fIsRealNote');
+    const linesEd = mountLinesEditor(body, body.querySelector('#fWbAmount'));
     let manual = !!w;
 
     const syncReal = () => {
@@ -1404,17 +2089,21 @@ function openWaybillForm(id) {
       if (state.waybills.some((x) => x.num === num && x.id !== rec.id)) {
         showToast('Номер уже занят', [`Накладная ${num} существует — укажите другой номер`], 'red'); return;
       }
+      // все проверки — до мутации rec, чтобы отклонённая правка не портила документ
+      const lines = linesEd.getLines();
+      const amount = lines.length ? sum(lines.map((l) => l.qty * l.price)) : (parseFloat(f.get('amount')) || 0);
+      if (amount <= 0) { showToast('Сумма должна быть больше нуля', ['Проверьте строки спецификации: нужны позиция, количество и цена больше нуля'], 'red'); return; }
       rec.num = num;
       rec.dealId = deal.id;
       rec.kind = DEAL_KIND[deal.kind].wbKind;
-      rec.amount = parseFloat(f.get('amount')) || 0;
+      rec.lines = lines;
+      rec.amount = amount;
       rec.goods = f.get('goods').trim();
       rec.isReal = fReal.checked;
       rec.dateMaterialFact = f.get('dateMaterialFact');
       // Is_Real = НЕТ → плановая дата оплаты не порождается (см. спецификацию)
       rec.datePaymentPlan = rec.isReal ? (f.get('datePaymentPlan') || addDays(rec.dateMaterialFact, deal.deferDays)) : null;
       rec.comment = f.get('comment').trim();
-      if (rec.amount <= 0) return;
       if (!w) state.waybills.push(rec);
       save(); closeModal(true); render();
       showToast(w ? 'Накладная обновлена' : 'Накладная создана',
@@ -1430,14 +2119,34 @@ function openWaybillForm(id) {
 
 function loadDemo() {
   const T = todayISO();
-  const dRomashka = { id: uuid(), name: 'Договор поставки №14', counterparty: 'ООО «Ромашка»', kind: 'sale', amount: 480000, shipDays: 5, deferDays: 10, comment: 'Аванс 100%, отгрузка в течение 5 дней' };
-  const dStal = { id: uuid(), name: 'Закупка металлопроката', counterparty: 'АО «СтальТрейд»', kind: 'purchase', amount: 750000, shipDays: 14, deferDays: 0, comment: 'Предоплата, поставка 14 дней' };
-  const dAgro = { id: uuid(), name: 'Закупка удобрений', counterparty: 'ООО «АгроСнаб»', kind: 'purchase', amount: 320000, shipDays: 0, deferDays: 15, comment: 'Отсрочка 15 дней после приёмки' };
-  const dTehno = { id: uuid(), name: 'Договор продажи №7', counterparty: 'ООО «ТехноДом»', kind: 'sale', amount: 560000, shipDays: 3, deferDays: 20, comment: 'Отсрочка 20 дней после отгрузки' };
+  simulation = null;
 
-  // живые остатки: разрыв возникает в будущем при выплате АгроСнабу — виден заранее
-  state = { deals: [dRomashka, dStal, dAgro, dTehno], payments: [], waybills: [], journal: [],
-    settings: { cashOpening: 250000, stockOpening: 400000 } };
+  // номенклатура
+  const iOgr = { id: uuid(), sku: 'АРТ-001', createdAt: addDays(T, -60), name: 'Секции ограждений', unit: 'шт', price: 12000, qtyOpening: 30, staleDays: 30 };
+  const iUdo = { id: uuid(), sku: 'АРТ-002', createdAt: addDays(T, -60), name: 'Удобрение азотное', unit: 'т', price: 40000, qtyOpening: 0, staleDays: 45 };
+  const iKond = { id: uuid(), sku: 'АРТ-003', createdAt: addDays(T, -60), name: 'Кондиционер настенный', unit: 'шт', price: 70000, qtyOpening: 10, staleDays: 21 };
+  const iMet = { id: uuid(), sku: 'АРТ-004', createdAt: addDays(T, -60), name: 'Металлопрокат', unit: 'т', price: 15000, qtyOpening: 0, staleDays: 60 };
+  const iFbs = { id: uuid(), sku: 'АРТ-005', createdAt: addDays(T, -60), name: 'Блоки ФБС', unit: 'шт', price: 6500, qtyOpening: 120, staleDays: 60 };
+
+  const dRomashka = { id: uuid(), name: 'Договор поставки №14', counterparty: 'ООО «Ромашка»', kind: 'sale', amount: 480000, shipDays: 5, deferDays: 10, comment: 'Аванс 100%, отгрузка в течение 5 дней', lines: [{ itemId: iOgr.id, qty: 40, price: 12000 }] };
+  const dStal = { id: uuid(), name: 'Закупка металлопроката', counterparty: 'АО «СтальТрейд»', kind: 'purchase', amount: 750000, shipDays: 14, deferDays: 0, comment: 'Предоплата, поставка 14 дней', lines: [{ itemId: iMet.id, qty: 50, price: 15000 }] };
+  const dAgro = { id: uuid(), name: 'Закупка удобрений', counterparty: 'ООО «АгроСнаб»', kind: 'purchase', amount: 320000, shipDays: 0, deferDays: 15, comment: 'Отсрочка 15 дней после приёмки', lines: [{ itemId: iUdo.id, qty: 8, price: 40000 }] };
+  const dTehno = { id: uuid(), name: 'Договор продажи №7', counterparty: 'ООО «ТехноДом»', kind: 'sale', amount: 560000, shipDays: 3, deferDays: 20, comment: 'Отсрочка 20 дней после отгрузки', lines: [{ itemId: iKond.id, qty: 8, price: 70000 }] };
+  const dStroy = { id: uuid(), name: 'Договор продажи №11', counterparty: 'ООО «СтройГрад»', kind: 'sale', amount: 650000, shipDays: 3, deferDays: 14, comment: 'Отсрочка 14 дней после отгрузки', lines: [{ itemId: iFbs.id, qty: 100, price: 6500 }] };
+
+  // живые остатки: разрыв возникает в будущем — виден заранее, симулятор предложит решения
+  state = {
+    deals: [dRomashka, dStal, dAgro, dTehno, dStroy],
+    payments: [], waybills: [], journal: [],
+    items: [iOgr, iUdo, iKond, iMet, iFbs],
+    otherPayments: [
+      { id: uuid(), name: 'Аренда склада', category: 'rent', priority: 'primary', amount: 70000, date: addDays(T, 3), recurring: 'monthly', done: false },
+      { id: uuid(), name: 'Подписка на сервис аналитики', category: 'other', priority: 'discretionary', amount: 25000, date: addDays(T, 4), recurring: 'monthly', done: false },
+      { id: uuid(), name: 'Зарплата', category: 'salary', priority: 'critical', amount: 140000, date: addDays(T, 6), recurring: 'monthly', done: false },
+      { id: uuid(), name: 'Налог УСН (аванс)', category: 'taxes', priority: 'critical', amount: 60000, date: addDays(T, 10), recurring: 'none', done: false },
+    ],
+    settings: { cashOpening: 300000, stockOpening: 400000 },
+  };
 
   const mkPay = (deal, num, amount, dayOffset) => ({
     id: uuid(), num, dealId: deal.id, kind: DEAL_KIND[deal.kind].payKind, amount,
@@ -1445,24 +2154,28 @@ function loadDemo() {
     dateMaterialPlan: addDays(addDays(T, dayOffset), deal.shipDays),
     comment: '', posted: false,
   });
-  const mkWb = (deal, num, amount, dayOffset, isReal, goods) => ({
+  const mkWb = (deal, num, amount, dayOffset, isReal, goods, lines) => ({
     id: uuid(), num, dealId: deal.id, kind: DEAL_KIND[deal.kind].wbKind, amount,
-    isReal, goods: goods || '',
+    isReal, goods: goods || '', lines: lines || [],
     dateMaterialFact: addDays(T, dayOffset),
     datePaymentPlan: isReal ? addDays(addDays(T, dayOffset), deal.deferDays) : null,
     comment: '', posted: false,
   });
 
-  // Ромашка (продажа): аванс 12 дней назад → план отгрузки −7 дн.; отгружено 300 из 480 с опозданием
+  // Ромашка (продажа): аванс 12 дней назад → план отгрузки −7 дн.; отгружено 25 из 40 шт с опозданием
+  // → к отгрузке 15 шт при складе 10 шт: дефицит по АРТ-001
   state.payments.push(mkPay(dRomashka, 'ПП-1', 480000, -12));
-  state.waybills.push(mkWb(dRomashka, 'НК-1', 300000, -4, true, 'секции ограждений, 40 шт.'));
-  // СтальТрейд (закупка): предоплата 6 дней назад → поставка ожидается через 8 дней (без флага)
+  state.waybills.push(mkWb(dRomashka, 'НК-1', 300000, -4, true, 'секции ограждений', [{ itemId: iOgr.id, qty: 25, price: 12000 }]));
+  // СтальТрейд (закупка): предоплата 6 дней назад → поставка 50 т через 8 дней
   state.payments.push(mkPay(dStal, 'ПП-2', 750000, -6));
-  // АгроСнаб (закупка): приёмка 10 дней назад → оплата через 5 дней (жёлтый флаг «скоро выплата»)
-  state.waybills.push(mkWb(dAgro, 'НК-2', 320000, -10, true, 'удобрения, 8 т'));
-  // ТехноДом (продажа): отгрузка 30 дней назад, оплата частичная → просроченная дебиторка
-  state.waybills.push(mkWb(dTehno, 'НК-3', 560000, -30, true, 'климатическое оборудование'));
+  // АгроСнаб (закупка): приёмка 8 т 10 дней назад → оплата через 5 дней
+  state.waybills.push(mkWb(dAgro, 'НК-2', 320000, -10, true, 'удобрения', [{ itemId: iUdo.id, qty: 8, price: 40000 }]));
+  // ТехноДом (продажа): отгрузка 30 дней назад, оплата частичная → просроченная дебиторка;
+  // остаток 2 кондиционера без движения 30 дней → залежалый сток
+  state.waybills.push(mkWb(dTehno, 'НК-3', 560000, -30, true, 'климатическое оборудование', [{ itemId: iKond.id, qty: 8, price: 70000 }]));
   state.payments.push(mkPay(dTehno, 'ПП-3', 200000, -8));
+  // СтройГрад (продажа): отгрузка 100 блоков 2 дня назад → оплата 650 000 через 12 дней
+  state.waybills.push(mkWb(dStroy, 'НК-5', 650000, -2, true, 'блоки ФБС', [{ itemId: iFbs.id, qty: 100, price: 6500 }]));
   // Виртуальная корректировка по Ромашке: Is_Real = НЕТ, регистры не трогает
   state.waybills.push(mkWb(dRomashka, 'НК-4', 50000, -2, false, 'перенос остатков (корректировка)'));
 
@@ -1480,8 +2193,8 @@ function loadDemo() {
   location.hash = '#/dashboard';
   render();
   showToast('Демо-сценарий загружен', [
-    '4 сделки, 3 платёжки, 4 накладные (одна виртуальная)',
-    'Смотрите красные флаги на дашборде и изоляцию Is_Real=НЕТ в журнале',
+    '5 сделок, 5 позиций склада, прочие платежи (аренда, налоги, зарплата)',
+    'На главном экране: разрыв заранее, дефицит по артикулу и симулятор решений',
   ]);
 }
 
@@ -1523,6 +2236,7 @@ function sanitizeImported(s) {
       shipDays: Math.max(0, parseInt(d.shipDays, 10) || 0),
       deferDays: Math.max(0, parseInt(d.deferDays, 10) || 0),
       comment: str(d.comment),
+      _srcLines: d.lines,
     }));
   const dealIds = new Set(deals.map((d) => d.id));
 
@@ -1550,6 +2264,7 @@ function sanitizeImported(s) {
         goods: str(w.goods), dateMaterialFact: w.dateMaterialFact,
         datePaymentPlan: isReal ? (isDate(w.datePaymentPlan) ? w.datePaymentPlan : addDays(w.dateMaterialFact, deal.deferDays)) : null,
         comment: str(w.comment), posted: !!w.posted,
+        _srcLines: w.lines,
       };
     });
 
@@ -1561,7 +2276,45 @@ function sanitizeImported(s) {
     ? { cashOpening: numOrNull(s.settings.cashOpening), stockOpening: numOrNull(s.settings.stockOpening) }
     : { cashOpening: null, stockOpening: null };
 
-  return { deals, payments, waybills, journal, settings };
+  // «грязные» id позиций ремапятся с сохранением ссылок из строк спецификаций
+  const itemIdMap = new Map();
+  const safeItemId = (v) => {
+    if (okId(v)) return v;
+    if (!itemIdMap.has(v)) itemIdMap.set(v, uuid());
+    return itemIdMap.get(v);
+  };
+  const items = (s.items || []).filter((i) => i && typeof i === 'object' && str(i.sku) && str(i.name))
+    .map((i) => ({
+      id: safeItemId(i.id),
+      sku: str(i.sku), name: str(i.name), unit: str(i.unit) || 'шт',
+      price: typeof i.price === 'number' && isFinite(i.price) && i.price >= 0 ? i.price : 0,
+      qtyOpening: typeof i.qtyOpening === 'number' && isFinite(i.qtyOpening) ? Math.max(0, i.qtyOpening) : 0,
+      staleDays: Math.max(0, parseInt(i.staleDays, 10) || 0),
+      createdAt: isDate(i.createdAt) ? i.createdAt : todayISO(),
+    }));
+  const itemIds = new Set(items.map((i) => i.id));
+  const resolveItemRef = (v) => (okId(v) ? v : itemIdMap.get(v));
+
+  const cleanLines = (lines) => Array.isArray(lines)
+    ? lines.map((l) => (l ? { ...l, itemId: resolveItemRef(l.itemId) } : l))
+        .filter((l) => l && itemIds.has(l.itemId) && num(l.qty) && typeof l.price === 'number' && isFinite(l.price) && l.price >= 0)
+        .map((l) => ({ itemId: l.itemId, qty: l.qty, price: l.price }))
+    : [];
+  for (const d of deals) { d.lines = cleanLines(d._srcLines); delete d._srcLines; }
+  for (const w of waybills) { w.lines = cleanLines(w._srcLines); delete w._srcLines; }
+
+  const otherPayments = (s.otherPayments || []).filter((p) => p && typeof p === 'object' && str(p.name) && num(p.amount) && isDate(p.date))
+    .map((p) => ({
+      id: okId(p.id) ? p.id : uuid(),
+      name: str(p.name),
+      category: OTHER_CATEGORIES[p.category] ? p.category : 'other',
+      priority: PRIORITIES[p.priority] ? p.priority : 'flexible',
+      amount: num(p.amount), date: p.date,
+      recurring: p.recurring === 'monthly' ? 'monthly' : 'none',
+      done: !!p.done,
+    }));
+
+  return { deals, payments, waybills, journal, settings, items, otherPayments };
 }
 
 function importJSON(file) {
@@ -1633,6 +2386,27 @@ function bindMainEvents() {
       else if (a === 'copy-uuid') copyText(id);
       else if (a === 'edit-balances') openBalancesForm();
       else if (a === 'goto-flags') document.getElementById('dash-flags')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      else if (a === 'simulate') {
+        const sol = lastSolutions[parseInt(el.dataset.idx, 10)];
+        if (sol) { simulation = { ...sol.sim, label: sol.title }; render(); }
+      }
+      else if (a === 'sim-apply') applySimulation();
+      else if (a === 'sim-reset') { simulation = null; render(); }
+      else if (a === 'new-item') openItemForm();
+      else if (a === 'edit-item') openItemForm(id);
+      else if (a === 'del-item') {
+        const used = state.deals.some((d) => (d.lines || []).some((l) => l.itemId === id)) ||
+          state.waybills.some((w) => (w.lines || []).some((l) => l.itemId === id));
+        if (used) { showToast('Нельзя удалить позицию', ['Она используется в строках сделок или накладных'], 'red'); return; }
+        if (confirm('Удалить позицию номенклатуры?')) { state.items = state.items.filter((i) => i.id !== id); save(); render(); }
+      }
+      else if (a === 'new-other') openOtherForm();
+      else if (a === 'edit-other') openOtherForm(id);
+      else if (a === 'del-other') { if (confirm('Удалить прочий платёж?')) { state.otherPayments = state.otherPayments.filter((p) => p.id !== id); save(); render(); } }
+      else if (a === 'toggle-other-done') {
+        const p = state.otherPayments.find((x) => x.id === id);
+        if (p) { p.done = !p.done; save(); render(); }
+      }
     });
   });
 }
@@ -1650,6 +2424,8 @@ document.addEventListener('DOMContentLoaded', () => {
   };
   $('#burger').addEventListener('click', () => syncSidebar(!$('#sidebar').classList.contains('open')));
   $('#sidebarOverlay').addEventListener('click', () => syncSidebar(false));
+  // тап по пункту меню закрывает сайдбар и при переходе на текущую страницу
+  $('#nav').addEventListener('click', (e) => { if (e.target.closest('a')) syncSidebar(false); });
   $('#btnDemo').addEventListener('click', () => {
     if (!state.deals.length || confirm('Текущие данные будут заменены демо-сценарием. Продолжить?')) loadDemo();
   });
@@ -1658,7 +2434,8 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#importFile').addEventListener('change', (e) => { if (e.target.files[0]) importJSON(e.target.files[0]); e.target.value = ''; });
   $('#btnWipe').addEventListener('click', () => {
     if (confirm('Удалить все данные без возможности восстановления?')) {
-      state = { deals: [], payments: [], waybills: [], journal: [] };
+      state = { deals: [], payments: [], waybills: [], journal: [], items: [], otherPayments: [] };
+      simulation = null;
       save(); render();
     }
   });
