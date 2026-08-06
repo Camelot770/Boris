@@ -253,6 +253,16 @@ body {
   .l-del { grid-area: del; }
 }
 
+/* ============ Оперативный план (Табл. 1–2) ============ */
+.plan-table { font-size: 12px; }
+.plan-table th { font-size: 10px; padding: 6px 8px; position: sticky; top: 0; background: var(--paper-3); z-index: 2; }
+.plan-table td { padding: 4px 8px; font-family: var(--font-mono); font-size: 11.5px; white-space: nowrap; }
+.plan-table td:first-child, .plan-table td:nth-child(2) { color: var(--ink-soft); }
+.plan-table tr.row-quiet td { color: var(--ink-faint); }
+.plan-table tr.row-quiet { opacity: .55; }
+.plan-table tr.row-today td { background: var(--amber-soft); }
+.plan-table .neg-cell { background: var(--red-soft); }
+
 /* ============ Выручка в двух разрезах ============ */
 .rev-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 0; border: 1px solid var(--rule-mid); }
 .rev-cell { padding: 14px 18px; border-right: 1px solid var(--rule); }

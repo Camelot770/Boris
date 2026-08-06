@@ -101,20 +101,44 @@ const dealById = (id) => state.deals.find((d) => d.id === id);
 const itemById = (id) => state.items.find((i) => i.id === id);
 
 /* Категории прочих платежей (вне сделок) и приоритеты по умолчанию */
+/* Терминология подразделов платёжной ведомости — по письму Б. от 06.08:
+   1. Обязательные (налоги, зарплата, коммунальные) · 2. Первоочередные
+   (основные поставщики) · 3. Не первоочередные (в т.ч. дискреционные) */
 const OTHER_CATEGORIES = {
   taxes: { label: 'Налоги', prio: 'critical' },
   salary: { label: 'Зарплата', prio: 'critical' },
+  utilities: { label: 'Коммунальные платежи', prio: 'critical' },
   rent: { label: 'Аренда', prio: 'primary' },
   admin: { label: 'Адм.-хоз. расходы', prio: 'primary' },
   dividends: { label: 'Дивиденды', prio: 'discretionary' },
   other: { label: 'Прочее', prio: 'flexible' },
 };
 const PRIORITIES = {
-  critical: { label: 'критичный', cls: 'badge-red', order: 0 },
+  critical: { label: 'обязательный', cls: 'badge-red', order: 0 },
   primary: { label: 'первоочередной', cls: 'badge-amber', order: 1 },
-  flexible: { label: 'гибкий', cls: 'badge-green', order: 2 },
+  flexible: { label: 'не первоочередной', cls: 'badge-green', order: 2 },
   discretionary: { label: 'дискреционный', cls: 'badge-grey', order: 3 },
 };
+
+/* Ближайшая дата договорного графика («5,20» — дни месяца) начиная с from.
+   Юридический блок: обязательства, которые ещё не возникли документами. */
+function nextScheduleDate(scheduleDays, from) {
+  const days = String(scheduleDays || '').split(/[,;\s]+/)
+    .map((x) => parseInt(x, 10)).filter((n) => n >= 1 && n <= 31);
+  if (!days.length) return null;
+  const [fy, fm, fd] = from.split('-').map(Number);
+  for (let off = 0; off < 3; off++) {
+    const total = fm - 1 + off;
+    const y = fy + Math.floor(total / 12), m = (total % 12) + 1;
+    const last = new Date(y, m, 0).getDate();
+    for (const d of [...days].sort((a, b) => a - b)) {
+      const day = Math.min(d, last);
+      if (off === 0 && day < fd) continue;
+      return `${y}-${String(m).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }
+  }
+  return null;
+}
 
 /* Вхождения прочего платежа в горизонте (повторяющиеся разворачиваются на лету).
    Ежемесячные считаются от базовой даты с зажимом дня месяца (31-е → 28/30-е),
@@ -629,7 +653,14 @@ function itemPlanMoves(itemId, today) {
     const remaining = Math.max(0, plannedQty - factQty);
     if (remaining <= 0) continue;
     const open = materialRegister(deal).open;
-    const dueDate = open.length ? open[0].date : null;
+    // плановая дата: из открытых квот (после оплат), иначе — из договорного
+    // графика (обязательства юр. блока, ещё не возникшие документами)
+    let dueDate = open.length ? open[0].date
+      : (deal.scheduleDays ? nextScheduleDate(deal.scheduleDays, today) : null);
+    // отгрузка со склада поставщика: получение = дата графика + время доставки
+    if (dueDate && !open.length && deal.kind === 'purchase' && deal.deliveryDays) {
+      dueDate = addDays(dueDate, deal.deliveryDays);
+    }
     plans.push({
       deal, remaining,
       qty: deal.kind === 'sale' ? -remaining : remaining,
@@ -640,6 +671,24 @@ function itemPlanMoves(itemId, today) {
   return plans;
 }
 
+/* Плановые события позиции для прогноза (общий помощник Табл.1 и склада):
+   продажи (оттоки) — просроченные на сегодня; закупки (притоки) — просроченные
+   не учитываем (консервативно, как в денежном прогнозе).
+   planned — те же события по ИСХОДНЫМ датам (для Табл.2 «план/факт/отклонение»). */
+function itemProjectionEvents(itemId, today) {
+  const events = [];
+  const planned = [];
+  const atRiskQty = [];
+  for (const p of itemPlanMoves(itemId, today)) {
+    if (!p.scheduled) continue;
+    planned.push({ date: p.dueDate, qty: p.qty, deal: p.deal });
+    if (p.qty < 0) events.push({ date: p.overdue ? today : p.dueDate, qty: p.qty, deal: p.deal });
+    else if (p.overdue) atRiskQty.push(p);
+    else events.push({ date: p.dueDate, qty: p.qty, deal: p.deal });
+  }
+  return { events, planned, atRiskQty };
+}
+
 /* Сводка по складу: остатки, прогноз, маркеры дефицита и залежалости */
 function computeItemsOutlook(horizon = 30) {
   const today = todayISO();
@@ -648,17 +697,7 @@ function computeItemsOutlook(horizon = 30) {
     const moves = itemMovements(item.id);
     const qtyToday = (item.qtyOpening || 0) + sum(moves.map((m) => m.qty));
     const plans = itemPlanMoves(item.id, today);
-
-    // прогноз: продажи (оттоки) — просроченные на сегодня; закупки (притоки) —
-    // просроченные не учитываем (консервативно, как в денежном прогнозе)
-    const events = [];
-    const atRiskQty = [];
-    for (const p of plans) {
-      if (!p.scheduled) continue;
-      if (p.qty < 0) events.push({ date: p.overdue ? today : p.dueDate, qty: p.qty, deal: p.deal });
-      else if (p.overdue) atRiskQty.push(p);
-      else events.push({ date: p.dueDate, qty: p.qty, deal: p.deal });
-    }
+    const { events, atRiskQty } = itemProjectionEvents(item.id, today);
     let q = qtyToday, minQty = qtyToday, minDate = today;
     for (let i = 0; i <= horizon; i++) {
       const d = addDays(today, i);
@@ -811,6 +850,8 @@ const ROUTES = {
   payments: { title: 'Платёжные документы', render: renderPayments },
   waybills: { title: 'Накладные', render: renderWaybills },
   tmc: { title: 'График ТМЦ', render: renderTmc },
+  plan: { title: 'Оперативный план', render: renderPlan },
+  'plan-t2': { title: 'Оперативный план', render: renderPlan },
   stock: { title: 'Склад и номенклатура', render: renderStock },
   cashflow: { title: 'CashFlow-календарь', render: renderCashflow },
   matrix: { title: 'Матрица ресурсов', render: renderMatrix },
@@ -825,7 +866,8 @@ function currentRoute() {
 
 function render() {
   const route = currentRoute();
-  document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('active', a.dataset.route === route));
+  const navRoute = route === 'plan-t2' ? 'plan' : route;
+  document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('active', a.dataset.route === navRoute));
   $('#pageTitle').textContent = ROUTES[route].title;
   $('#todayChip').textContent = 'Сегодня: ' + fmtDate(todayISO());
   const flags = computeFlags();
@@ -1428,6 +1470,175 @@ function renderWaybills() {
   </div></div>`;
 }
 
+/* ---------- Оперативный план (Табл. 1 и Табл. 2 из письма Б.) ----------
+   Табличный вид по дням, как в исходном Excel: движение ТМЦ в натуральных
+   единицах по каждой позиции + денежный поток. Горизонт — до момента
+   последнего исполнения обязательств. Красные ячейки = маркеры. */
+
+function planHorizonDays(today) {
+  let maxDate = addDays(today, 14);
+  for (const deal of state.deals) {
+    for (const o of moneyRegister(deal).open) if (o.date > maxDate) maxDate = o.date;
+    for (const o of materialRegister(deal).open) if (o.date > maxDate) maxDate = o.date;
+    if (deal.scheduleDays) {
+      const nd = nextScheduleDate(deal.scheduleDays, today);
+      if (nd && nd > maxDate) maxDate = nd;
+    }
+  }
+  for (const p of state.otherPayments) {
+    if (!p.done && p.recurring !== 'monthly' && p.date > maxDate) maxDate = p.date;
+  }
+  return Math.min(120, diffDays(maxDate, today) + 2);
+}
+
+function fmtQty(q) {
+  const r = Math.round(q * 1000) / 1000;
+  return r % 1 ? r.toFixed(Math.abs(r) < 10 ? 2 : 1) : String(r);
+}
+
+function renderPlan() {
+  const today = todayISO();
+  if (!state.deals.length && !state.items.length) {
+    return `<div class="card">${emptyBlock('table', 'Оперативный план пуст',
+      'Создайте сделки, номенклатуру и документы — здесь появится таблица движения ТМЦ и денег по дням, как в исходной Excel-модели.', demoButtonHTML)}</div>`;
+  }
+  const horizon = planHorizonDays(today);
+  const proj = computeProjection(horizon);
+  const mode = location.hash.includes('t2') ? 't2' : 't1';
+
+  /* Экономическая шапка: выручка по отгрузке и по оплате, себестоимость, прибыль */
+  let revShipped = 0, revPaid = 0, cost = 0, costKnown = true;
+  for (const w of state.waybills) {
+    if (!w.posted || !w.isReal || w.kind !== 'out') continue;
+    revShipped += w.amount;
+    if (Array.isArray(w.lines) && w.lines.length) {
+      for (const l of w.lines) cost += l.qty * ((itemById(l.itemId) || {}).price || 0);
+    } else costKnown = false;
+  }
+  for (const p of state.payments) if (p.posted && p.kind === 'in') revPaid += p.amount;
+  const profit = revShipped - cost;
+  const econHTML = `
+  <div class="rev-grid" style="margin-bottom:20px">
+    <div class="rev-cell"><div class="rev-label">Выручка по отгрузке</div>
+      <div class="rev-value">${fmtMoney(revShipped)}</div><div class="rev-sub">P&L, реальные накладные</div></div>
+    <div class="rev-cell"><div class="rev-label">Выручка по оплате</div>
+      <div class="rev-value">${fmtMoney(revPaid)}</div><div class="rev-sub">Cash Flow, входящие платёжки</div></div>
+    <div class="rev-cell"><div class="rev-label">Себестоимость</div>
+      <div class="rev-value">${fmtMoney(cost)}</div><div class="rev-sub">управленческая, по учётным ценам${costKnown ? '' : ' · есть накладные без спецификации'}</div></div>
+    <div class="rev-cell"><div class="rev-label">Прибыль</div>
+      <div class="rev-value ${profit < 0 ? 'neg-cell' : ''}">${fmtMoney(profit)}</div><div class="rev-sub">может отличаться от бухгалтерской</div></div>
+  </div>`;
+
+  /* Платёжная ведомость на сегодня: подразделы по письму Б. */
+  const todayEvents = proj.days[0] ? proj.days[0].events.filter((e) => e.cash < 0) : [];
+  const groups = { critical: [], primary: [], other: [] };
+  for (const e of todayEvents) {
+    const prio = e.prio || (e.overdue ? 'critical' : 'primary');
+    if (prio === 'critical') groups.critical.push(e);
+    else if (prio === 'primary') groups.primary.push(e);
+    else groups.other.push(e);
+  }
+  const groupHTML = (title, list) => list.length
+    ? `<div class="cal-day"><div class="cal-date">${title} <span class="badge badge-grey">${fmtMoney(-sum(list.map((e) => e.cash)))}</span></div>
+       ${list.map((e) => `<div class="cal-event out"><span>${esc(e.label)}${e.overdue ? ' <span class="badge badge-red">просрочено</span>' : ''}</span><span class="amt">−${fmtMoney(-e.cash)}</span></div>`).join('')}</div>`
+    : '';
+  const vedomostHTML = todayEvents.length
+    ? groupHTML('1. Обязательные (налоги, зарплата, коммунальные)', groups.critical) +
+      groupHTML('2. Первоочередные (основные поставщики)', groups.primary) +
+      groupHTML('3. Не первоочередные', groups.other)
+    : '<p style="color:var(--ink-soft);font-size:13px">На сегодня выплат нет.</p>';
+
+  /* Колонки позиций: только с остатком или движением */
+  const itemCols = state.items.map((item) => {
+    const moves = itemMovements(item.id);
+    const qty0 = (item.qtyOpening || 0) + sum(moves.map((m) => m.qty));
+    const { events, planned } = itemProjectionEvents(item.id, today);
+    return { item, qty0, events, planned, active: Math.abs(qty0) > 0.004 || events.length || planned.length };
+  }).filter((c) => c.active);
+
+  /* Табл.1: строки-дни; ДС приток/отток/остаток + остаток каждой позиции */
+  const rowsT1 = [];
+  const qtys = itemCols.map((c) => c.qty0);
+  for (let i = 0; i <= horizon; i++) {
+    const d = proj.days[i];
+    if (!d) break;
+    const inflow = sum(d.events.filter((e) => e.cash > 0).map((e) => e.cash));
+    const outflow = sum(d.events.filter((e) => e.cash < 0).map((e) => e.cash));
+    itemCols.forEach((c, j) => { qtys[j] += sum(c.events.filter((e) => e.date === d.date).map((e) => e.qty)); });
+    const hasActivity = inflow || outflow || d.cashGap ||
+      itemCols.some((c, j) => c.events.some((e) => e.date === d.date)) || i === 0;
+    rowsT1.push(`<tr class="${hasActivity ? '' : 'row-quiet'}">
+      <td class="num">${i}</td>
+      <td class="num">${fmtDate(d.date)}</td>
+      <td class="num">${inflow ? '+' + fmtMoney(inflow) : ''}</td>
+      <td class="num">${outflow ? '−' + fmtMoney(-outflow) : ''}</td>
+      <td class="num ${d.cashGap ? 'neg-cell' : ''}">${fmtMoney(d.cash)}${d.cashGap ? ' ⚑' : ''}</td>
+      ${itemCols.map((c, j) => `<td class="num ${qtys[j] < -0.004 ? 'neg-cell' : ''}">${fmtQty(qtys[j])}${qtys[j] < -0.004 ? ' ⚑' : ''}</td>`).join('')}
+    </tr>`);
+  }
+  const t1HTML = `
+  <div class="table-wrap"><table class="plan-table">
+    <thead>
+      <tr><th class="num" rowspan="2">№</th><th class="num" rowspan="2">Дата</th>
+        <th colspan="3" style="text-align:center">Денежные средства, ₽</th>
+        ${itemCols.map((c) => `<th class="num" rowspan="2" title="${esc(c.item.name)}">${esc(c.item.sku)}, ${esc(c.item.unit)}</th>`).join('')}</tr>
+      <tr><th class="num">Приток</th><th class="num">Отток</th><th class="num">Остаток</th></tr>
+    </thead>
+    <tbody>${rowsT1.join('')}</tbody>
+  </table></div>`;
+
+  /* Табл.2: план / факт / отклонение движений по дням (окно: −14 дн … горизонт).
+     План — по исходным договорным датам (просрочка остаётся на своей дате),
+     факт — из накладных; отклонение = факт − план. */
+  let t2HTML = '';
+  if (mode === 't2') {
+    const start = addDays(today, -14);
+    const dates = [];
+    for (let i = -14; i <= horizon; i++) dates.push(addDays(today, i));
+    const rowsT2 = dates.map((d, di) => {
+      const cells = itemCols.map((c) => {
+        const planQty = sum(c.planned.filter((e) => e.date === d).map((e) => e.qty));
+        const factQty = sum(itemMovements(c.item.id).filter((m) => m.date === d).map((m) => m.qty));
+        const dev = factQty - planQty;
+        // отклонение имеет смысл только там, где был план; маркер — план,
+        // не исполненный к прошедшей дате (факт без плана — закрытая квота, норма)
+        const hasPlan = Math.abs(planQty) > 0.004;
+        const devBad = hasPlan && d <= today && Math.abs(dev) > 0.004;
+        return `<td class="num">${planQty ? fmtQty(planQty) : ''}</td>
+          <td class="num">${factQty ? fmtQty(factQty) : ''}</td>
+          <td class="num ${devBad ? 'neg-cell' : ''}">${hasPlan && d <= today ? fmtQty(dev) : ''}${devBad ? ' ⚑' : ''}</td>`;
+      }).join('');
+      const any = itemCols.some((c) =>
+        c.planned.some((e) => e.date === d) || itemMovements(c.item.id).some((m) => m.date === d));
+      return `<tr class="${any ? '' : 'row-quiet'} ${d === today ? 'row-today' : ''}">
+        <td class="num">${fmtDate(d)}${d === today ? ' ←' : ''}</td>${cells}</tr>`;
+    });
+    t2HTML = `
+    <div class="table-wrap"><table class="plan-table">
+      <thead>
+        <tr><th class="num" rowspan="2">Дата</th>
+          ${itemCols.map((c) => `<th colspan="3" style="text-align:center" title="${esc(c.item.name)}">${esc(c.item.sku)}, ${esc(c.item.unit)}</th>`).join('')}</tr>
+        <tr>${itemCols.map(() => '<th class="num">План</th><th class="num">Факт</th><th class="num">Откл.</th>').join('')}</tr>
+      </thead>
+      <tbody>${rowsT2.join('')}</tbody>
+    </table></div>
+    <div class="legend" style="margin-top:8px"><span>Отклонение = факт − план; красное — план не исполнен (причина маркера). Мы не разбираем причины — мы указываем на них.</span></div>`;
+  }
+
+  return `<div class="page-head">
+    <div class="desc">Система оперативного управления: что, когда, сколько — по каждому виду ТМЦ в натуральных единицах и по деньгам. Горизонт — до последнего исполнения обязательств (${horizon} дн.). Красные ячейки ⚑ — маркеры для управленческих решений.</div>
+    <div class="spacer"></div>
+    <div class="row-actions">
+      <a class="btn ${mode === 't1' ? 'btn-primary' : 'btn-outline'}" href="#/plan">Табл. 1 · Остатки</a>
+      <a class="btn ${mode === 't2' ? 'btn-primary' : 'btn-outline'}" href="#/plan-t2">Табл. 2 · План/Факт</a>
+    </div>
+  </div>
+  ${econHTML}
+  ${mode === 't1' ? `<div class="card">${cardTitle('table', 'Табл. 1 — движение ТМЦ и ДС по дням', 'натуральные единицы; остатки на конец дня')}${t1HTML}</div>
+  <div class="card">${cardTitle('banknote', 'Платёжная ведомость на сегодня', 'сколько и кому мы платим сегодня')}${vedomostHTML}</div>`
+  : `<div class="card">${cardTitle('table', 'Табл. 2 — план / факт / отклонение', 'почему возник маркер: план не исполнен')}${t2HTML}</div>`}`;
+}
+
 /* ---------- Склад и номенклатура ---------- */
 function renderStock() {
   const today = todayISO();
@@ -1845,7 +2056,28 @@ function renderHelp() {
       <li><b>Живые остатки</b> ДС и склада задаются вручную (из выписки и инвентаризации) или считаются из проведённых документов.</li>
     </ul>
 
-    <h2>5. Склад, номенклатура и прочие платежи</h2>
+    <h2>5. Оперативный план (Табл. 1 и Табл. 2)</h2>
+    <p>Главный рабочий вид менеджера — таблицы по дням, как в исходной Excel-модели. Система отвечает: где, чего, сколько и почему. Горизонт планирования — до момента последнего исполнения обязательств.</p>
+    <ul>
+      <li><b>Табл. 1</b> — движение ТМЦ в натуральных единицах (литры, метры, тонны) по каждой позиции и денежный поток: остатки на конец каждого дня, красные ячейки-маркеры на минусах.</li>
+      <li><b>Табл. 2</b> — по каждой позиции три столбца: план / факт / отклонение. Мы не разбираем причины — мы указываем на них: видно, какой план на какую дату не исполнен.</li>
+      <li><b>Платёжная ведомость на сегодня</b> — «сколько и кому мы платим сегодня», по подразделам: 1) Обязательные (налоги, зарплата, коммунальные) · 2) Первоочередные (основные поставщики) · 3) Не первоочередные.</li>
+      <li><b>Экономическая шапка</b> — выручка по отгрузке и по оплате, себестоимость и прибыль (управленческие, по учётным ценам — могут отличаться от бухгалтерских).</li>
+      <li><b>Источники плана</b>: существующие обязательства (ДЗ/КЗ по датам и позициям) и юридический блок договора — график поставок (например, 5-го и 20-го числа) и время доставки, если отгрузка со склада поставщика.</li>
+    </ul>
+
+    <h2>6. Рабочие места ввода информации</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Потоки</th><th>Менеджмент закупок</th><th>Бухгалтерия</th><th>Менеджмент продаж</th></tr></thead>
+      <tbody>
+        <tr><td><b>ТМЦ</b></td><td>Товарно-транспортные документы</td><td>Товарно-транспортные документы</td><td>Товарно-транспортные документы</td></tr>
+        <tr><td><b>ДС</b></td><td>Счета-фактуры от поставщиков</td><td>Платёжные документы</td><td>Счета на оплату покупателям</td></tr>
+        <tr><td></td><td>Управленческий блок + бухгалтерия, всё с указанием дат</td><td>Только бухгалтерия</td><td>Управленческий блок + бухгалтерия, всё с указанием дат</td></tr>
+      </tbody>
+    </table></div>
+    <p style="margin-top:8px">Дашборды — для менеджмента и топ-менеджмента: менеджмент готовит информацию, топ-менеджмент принимает решения. Фактическую картину бытия изменить практически невозможно.</p>
+
+    <h2>7. Склад, номенклатура и прочие платежи</h2>
     <ul>
       <li><b>Поартикульный учёт.</b> Справочник номенклатуры; сделки и накладные ведут спецификацию позиций (кол-во × цена). Остаток каждого артикула считается в натуре по реальным проведённым накладным.</li>
       <li><b>Маркер дефицита</b> — по каждому артикулу строится прогноз остатка на 30 дней с учётом обязательств по отгрузке и ожидаемых поставок; уход в минус подсвечивается красным и попадает в счётчик маркеров.</li>
@@ -1890,6 +2122,12 @@ function openDealForm(id) {
       <div class="field"><label>Отсрочка платежа после перемещения ТМЦ, дней</label>
         <input name="deferDays" type="number" min="0" step="1" value="${d ? d.deferDays : 10}">
         <div class="note">Из неё считается Date_Payment_Execution_Plan накладных: факт + отсрочка.</div></div>
+      <div class="field"><label>Доставка / логистика, дней</label>
+        <input name="deliveryDays" type="number" min="0" step="1" value="${d ? d.deliveryDays || 0 : 0}">
+        <div class="note">Если отгрузка со склада поставщика — время в пути до нас. Прибавляется к плану перемещения ТМЦ.</div></div>
+      <div class="field"><label>График по договору, дни месяца</label>
+        <input name="scheduleDays" value="${d ? esc(d.scheduleDays || '') : ''}" placeholder="напр.: 5, 20">
+        <div class="note">Юридический блок: регулярные отгрузки/поставки (например, 5-го и 20-го числа). Планирует остаток обязательств, пока нет документов.</div></div>
       <div class="field full"><label>Комментарий</label>
         <input name="comment" value="${d ? esc(d.comment || '') : ''}"></div>
       <div class="form-actions full">
@@ -1918,6 +2156,8 @@ function openDealForm(id) {
       rec.amount = amount;
       rec.shipDays = Math.max(0, parseInt(f.get('shipDays'), 10) || 0);
       rec.deferDays = Math.max(0, parseInt(f.get('deferDays'), 10) || 0);
+      rec.deliveryDays = Math.max(0, parseInt(f.get('deliveryDays'), 10) || 0);
+      rec.scheduleDays = f.get('scheduleDays').trim();
       rec.comment = f.get('comment').trim();
       if (!d) state.deals.push(rec);
       // направление привязанных документов следует за типом сделки
@@ -1968,8 +2208,9 @@ function openPaymentForm(id) {
       kindNote.textContent = deal ? 'Тип: ' + DEAL_KIND[deal.kind].payLabel : '';
       if (!deal || !fPayDate.value) return;
       if (force || !manual) {
-        fMatPlan.value = addDays(fPayDate.value, deal.shipDays);
-        note.textContent = `Рассчитано из договора: оплата + ${deal.shipDays} дн. Можно скорректировать вручную.`;
+        const lead = deal.shipDays + (deal.deliveryDays || 0);
+        fMatPlan.value = addDays(fPayDate.value, lead);
+        note.textContent = `Рассчитано из договора: оплата + ${deal.shipDays} дн.${deal.deliveryDays ? ` + доставка ${deal.deliveryDays} дн.` : ''} Можно скорректировать вручную.`;
         manual = false;
       }
     };
@@ -1996,7 +2237,7 @@ function openPaymentForm(id) {
       rec.kind = DEAL_KIND[deal.kind].payKind;
       rec.amount = amount;
       rec.datePaymentExecution = f.get('datePaymentExecution');
-      rec.dateMaterialPlan = f.get('dateMaterialPlan') || addDays(rec.datePaymentExecution, deal.shipDays);
+      rec.dateMaterialPlan = f.get('dateMaterialPlan') || addDays(rec.datePaymentExecution, deal.shipDays + (deal.deliveryDays || 0));
       rec.comment = f.get('comment').trim();
       if (!p) state.payments.push(rec);
       save(); closeModal(true); render();
@@ -2122,23 +2363,26 @@ function loadDemo() {
   simulation = null;
 
   // номенклатура
-  const iOgr = { id: uuid(), sku: 'АРТ-001', createdAt: addDays(T, -60), name: 'Секции ограждений', unit: 'шт', price: 12000, qtyOpening: 30, staleDays: 30 };
+  const iOgr = { id: uuid(), sku: 'АРТ-001', createdAt: addDays(T, -60), name: 'Секции ограждений', unit: 'шт', price: 8500, qtyOpening: 30, staleDays: 30 };
   const iUdo = { id: uuid(), sku: 'АРТ-002', createdAt: addDays(T, -60), name: 'Удобрение азотное', unit: 'т', price: 40000, qtyOpening: 0, staleDays: 45 };
-  const iKond = { id: uuid(), sku: 'АРТ-003', createdAt: addDays(T, -60), name: 'Кондиционер настенный', unit: 'шт', price: 70000, qtyOpening: 10, staleDays: 21 };
+  const iKond = { id: uuid(), sku: 'АРТ-003', createdAt: addDays(T, -60), name: 'Кондиционер настенный', unit: 'шт', price: 52000, qtyOpening: 10, staleDays: 21 };
   const iMet = { id: uuid(), sku: 'АРТ-004', createdAt: addDays(T, -60), name: 'Металлопрокат', unit: 'т', price: 15000, qtyOpening: 0, staleDays: 60 };
-  const iFbs = { id: uuid(), sku: 'АРТ-005', createdAt: addDays(T, -60), name: 'Блоки ФБС', unit: 'шт', price: 6500, qtyOpening: 120, staleDays: 60 };
+  const iFbs = { id: uuid(), sku: 'АРТ-005', createdAt: addDays(T, -60), name: 'Блоки ФБС', unit: 'шт', price: 4800, qtyOpening: 120, staleDays: 60 };
+  const iFuel = { id: uuid(), sku: 'АРТ-006', createdAt: addDays(T, -60), name: 'Дизельное топливо', unit: 'л', price: 62, qtyOpening: 400, staleDays: 90 };
 
   const dRomashka = { id: uuid(), name: 'Договор поставки №14', counterparty: 'ООО «Ромашка»', kind: 'sale', amount: 480000, shipDays: 5, deferDays: 10, comment: 'Аванс 100%, отгрузка в течение 5 дней', lines: [{ itemId: iOgr.id, qty: 40, price: 12000 }] };
   const dStal = { id: uuid(), name: 'Закупка металлопроката', counterparty: 'АО «СтальТрейд»', kind: 'purchase', amount: 750000, shipDays: 14, deferDays: 0, comment: 'Предоплата, поставка 14 дней', lines: [{ itemId: iMet.id, qty: 50, price: 15000 }] };
   const dAgro = { id: uuid(), name: 'Закупка удобрений', counterparty: 'ООО «АгроСнаб»', kind: 'purchase', amount: 320000, shipDays: 0, deferDays: 15, comment: 'Отсрочка 15 дней после приёмки', lines: [{ itemId: iUdo.id, qty: 8, price: 40000 }] };
   const dTehno = { id: uuid(), name: 'Договор продажи №7', counterparty: 'ООО «ТехноДом»', kind: 'sale', amount: 560000, shipDays: 3, deferDays: 20, comment: 'Отсрочка 20 дней после отгрузки', lines: [{ itemId: iKond.id, qty: 8, price: 70000 }] };
   const dStroy = { id: uuid(), name: 'Договор продажи №11', counterparty: 'ООО «СтройГрад»', kind: 'sale', amount: 650000, shipDays: 3, deferDays: 14, comment: 'Отсрочка 14 дней после отгрузки', lines: [{ itemId: iFbs.id, qty: 100, price: 6500 }] };
+  // обязательство только из юр. блока: график поставок 5-го и 20-го, доставка 2 дня
+  const dFuel = { id: uuid(), name: 'Договор поставки топлива', counterparty: 'ООО «НефтеТрейд»', kind: 'purchase', amount: 124000, shipDays: 0, deferDays: 10, deliveryDays: 2, scheduleDays: '5, 20', comment: 'Поставки 5-го и 20-го числа, доставка 2 дня', lines: [{ itemId: iFuel.id, qty: 2000, price: 62 }] };
 
   // живые остатки: разрыв возникает в будущем — виден заранее, симулятор предложит решения
   state = {
-    deals: [dRomashka, dStal, dAgro, dTehno, dStroy],
+    deals: [dRomashka, dStal, dAgro, dTehno, dStroy, dFuel],
     payments: [], waybills: [], journal: [],
-    items: [iOgr, iUdo, iKond, iMet, iFbs],
+    items: [iOgr, iUdo, iKond, iMet, iFbs, iFuel],
     otherPayments: [
       { id: uuid(), name: 'Аренда склада', category: 'rent', priority: 'primary', amount: 70000, date: addDays(T, 3), recurring: 'monthly', done: false },
       { id: uuid(), name: 'Подписка на сервис аналитики', category: 'other', priority: 'discretionary', amount: 25000, date: addDays(T, 4), recurring: 'monthly', done: false },
@@ -2151,7 +2395,7 @@ function loadDemo() {
   const mkPay = (deal, num, amount, dayOffset) => ({
     id: uuid(), num, dealId: deal.id, kind: DEAL_KIND[deal.kind].payKind, amount,
     datePaymentExecution: addDays(T, dayOffset),
-    dateMaterialPlan: addDays(addDays(T, dayOffset), deal.shipDays),
+    dateMaterialPlan: addDays(addDays(T, dayOffset), deal.shipDays + (deal.deliveryDays || 0)),
     comment: '', posted: false,
   });
   const mkWb = (deal, num, amount, dayOffset, isReal, goods, lines) => ({
@@ -2235,6 +2479,8 @@ function sanitizeImported(s) {
       amount: num(d.amount) || 0,
       shipDays: Math.max(0, parseInt(d.shipDays, 10) || 0),
       deferDays: Math.max(0, parseInt(d.deferDays, 10) || 0),
+      deliveryDays: Math.max(0, parseInt(d.deliveryDays, 10) || 0),
+      scheduleDays: str(d.scheduleDays),
       comment: str(d.comment),
       _srcLines: d.lines,
     }));
@@ -2248,7 +2494,7 @@ function sanitizeImported(s) {
         id: okId(p.id) ? p.id : uuid(), num: str(p.num) || 'ПП-?', dealId: dealRef,
         kind: DEAL_KIND[deal.kind].payKind, amount: num(p.amount),
         datePaymentExecution: p.datePaymentExecution,
-        dateMaterialPlan: isDate(p.dateMaterialPlan) ? p.dateMaterialPlan : addDays(p.datePaymentExecution, deal.shipDays),
+        dateMaterialPlan: isDate(p.dateMaterialPlan) ? p.dateMaterialPlan : addDays(p.datePaymentExecution, deal.shipDays + (deal.deliveryDays || 0)),
         comment: str(p.comment), posted: !!p.posted,
       };
     });
