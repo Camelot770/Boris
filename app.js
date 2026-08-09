@@ -845,13 +845,14 @@ function showToast(title, lines, kind = 'blue') {
 }
 
 const ROUTES = {
-  dashboard: { title: 'Главный экран', render: renderDashboard },
+  dashboard: { title: 'Главный экран', render: renderPlan },
+  analytics: { title: 'Аналитика и графики', render: renderAnalytics },
   deals: { title: 'Сделки', render: renderDeals },
   payments: { title: 'Платёжные документы', render: renderPayments },
   waybills: { title: 'Накладные', render: renderWaybills },
   tmc: { title: 'График ТМЦ', render: renderTmc },
-  plan: { title: 'Оперативный план', render: renderPlan },
-  'plan-t2': { title: 'Оперативный план', render: renderPlan },
+  plan: { title: 'Главный экран', render: renderPlan },
+  'plan-t2': { title: 'Главный экран', render: renderPlan },
   stock: { title: 'Склад и номенклатура', render: renderStock },
   cashflow: { title: 'CashFlow-календарь', render: renderCashflow },
   matrix: { title: 'Матрица ресурсов', render: renderMatrix },
@@ -866,7 +867,7 @@ function currentRoute() {
 
 function render() {
   const route = currentRoute();
-  const navRoute = route === 'plan-t2' ? 'plan' : route;
+  const navRoute = route === 'plan-t2' || route === 'plan' ? 'dashboard' : route;
   document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('active', a.dataset.route === navRoute));
   $('#pageTitle').textContent = ROUTES[route].title;
   $('#todayChip').textContent = 'Сегодня: ' + fmtDate(todayISO());
@@ -898,20 +899,10 @@ function cardTitle(icon, title, hint) {
 const demoButtonHTML = `<button class="btn btn-primary" data-action="demo">Загрузить демо-сценарий</button>`;
 
 /* ---------- Дашборд ---------- */
-function renderDashboard(flags) {
-  if (!state.deals.length && !state.payments.length && !state.waybills.length) {
-    return `<div class="card">${emptyBlock('grid', 'Система пуста',
-      'Создайте сделку и документы — или загрузите демонстрационный сценарий, который показывает все механики: счётчик красных маркеров, матрицу ликвидности, прогноз по дням и изоляцию виртуальных накладных.',
-      demoButtonHTML)}</div>`;
-  }
-
-  const today = todayISO();
+/* Герой-счётчик красных маркеров: флаги + разрыв + дефициты (общий для страниц) */
+function buildMarkerHero(flags, proj, mx, stockOutlook) {
+  const today = proj.today;
   const reds = flags.filter((f) => f.severity === 'red');
-  const proj = computeProjection(30);
-  const mx = liquidityMatrix();
-  const stockOutlook = computeItemsOutlook(30);
-
-  /* Счётчик красных маркеров: флаги + кассовый разрыв + дефицит ТМЦ + дефициты позиций */
   const markerCount = reds.length + (proj.firstGap ? 1 : 0) + (proj.firstDeficit ? 1 : 0) + stockOutlook.deficitCount;
   const markerSubs = [];
   if (proj.firstGap) markerSubs.push(`кассовый разрыв ${fmtDate(proj.firstGap.date)} (через ${diffDays(proj.firstGap.date, today)} дн.)`);
@@ -920,7 +911,7 @@ function renderDashboard(flags) {
   if (reds.length) markerSubs.push(`просрочек: ${reds.length}`);
   if (stockOutlook.staleCount) markerSubs.push(`заморожено ${fmtMoney(stockOutlook.frozenTotal)} (${stockOutlook.staleCount} залежалых поз.)`);
 
-  const counterHTML = `
+  return `
   <div class="marker-hero ${markerCount ? 'alert' : 'calm'}">
     <div class="marker-count-wrap">
       <div class="marker-count">${markerCount}</div>
@@ -932,7 +923,7 @@ function renderDashboard(flags) {
            <div class="marker-sub">${markerSubs.map(esc).join(' · ')}</div>
            <button class="btn btn-outline btn-sm" style="margin-top:10px" data-action="goto-flags">Спуститься к причинам</button>`
         : `<div class="marker-title">Бизнес работает нормально</div>
-           <div class="marker-sub">Все обязательства исполняются в срок, разрывов на горизонте 30 дней нет. Вы свободны от операционки.</div>`}
+           <div class="marker-sub">Все обязательства исполняются в срок, разрывов на горизонте нет. Вы свободны от операционки.</div>`}
     </div>
     <div class="marker-balances">
       <div class="mb-row"><span class="mb-label">Живой остаток ДС</span>
@@ -943,6 +934,17 @@ function renderDashboard(flags) {
         · <button class="link-btn" data-action="edit-balances">изменить</button></div>
     </div>
   </div>`;
+}
+
+function renderAnalytics(flags) {
+  if (!state.deals.length && !state.payments.length && !state.waybills.length) {
+    return `<div class="card">${emptyBlock('chart', 'Аналитика пуста',
+      'Создайте сделку и документы — или загрузите демонстрационный сценарий.', demoButtonHTML)}</div>`;
+  }
+
+  const today = todayISO();
+  const proj = computeProjection(30);
+  const mx = liquidityMatrix();
 
   /* Матрица товарно-денежного баланса: Надо = Мы должны − (Есть + Нам должны) */
   const matrixHTML = `
@@ -979,71 +981,16 @@ function renderDashboard(flags) {
     <span>«Мы должны» — КЗ поставщикам и обязательства по отгрузке за предоплаты</span>
   </div></div>`;
 
-  /* Симулятор «Что если?»: активное моделирование либо готовые решения.
-     Таблица, график и atRisk ниже строятся из одного прогноза (shownProj) —
-     в режиме моделирования всё показывает сценарий. */
-  let simHTML = '';
-  const simProj = simulation ? computeProjection(30, simulation) : null;
-  const shownProj = simProj || proj;
-
-  const eventDays = shownProj.days.filter((d) => d.events.length || d.cashGap || d.deficit);
-  const projRows = eventDays.slice(0, 12).map((d) => `
-    <tr>
-      <td class="num">${fmtDate(d.date)}</td>
-      <td>${d.events.map((e) => `<div class="cell-sub">${e.cash > 0 || e.stock > 0 ? '+' : '−'} ${esc(e.label)}${e.sim ? ' <span class="badge badge-amber">сценарий</span>' : ''}${e.overdue ? ' <span class="badge badge-red">просрочено → сегодня</span>' : ''}</div>`).join('') || '<span class="cell-sub">—</span>'}</td>
-      <td class="num ${d.cashGap ? 'neg-cell' : ''}">${fmtMoney(d.cash)}${d.cashGap ? ' ⚑' : ''}</td>
-      <td class="num ${d.deficit ? 'neg-cell' : ''}">${fmtMoney(d.stock)}${d.deficit ? ' ⚑' : ''}</td>
-    </tr>`).join('');
-
-  const atRiskHTML = shownProj.atRisk.length
-    ? `<div class="callout callout-grey" style="margin-top:12px">Вне прогноза (просроченные притоки, на них нельзя рассчитывать): ${shownProj.atRisk.map((r) =>
+  const atRiskHTML = proj.atRisk.length
+    ? `<div class="callout callout-grey" style="margin-top:12px">Вне прогноза (просроченные притоки, на них нельзя рассчитывать): ${proj.atRisk.map((r) =>
         esc(`${r.kind === 'money' ? 'оплата' : 'поставка'} ${fmtMoney(r.amount)} от ${r.deal.counterparty} (ждали ${fmtDate(r.date)})`)).join('; ')}.</div>`
     : '';
 
-  if (simulation && simProj) {
-    const before = proj.firstGap ? `разрыв ${fmtDate(proj.firstGap.date)} (${fmtMoney(proj.firstGap.cash)})` : 'разрыва нет';
-    const after = simProj.firstGap ? `разрыв ${fmtDate(simProj.firstGap.date)} (${fmtMoney(simProj.firstGap.cash)})` : 'разрыва нет';
-    simHTML = `
-    <div class="sim-banner">
-      <div class="sim-banner-head">Режим моделирования: ${esc(simulation.label || 'сценарий')}</div>
-      <div class="sim-banner-body">Было: ${esc(before)} → Станет: <b>${esc(after)}</b>. График ниже показывает сценарий (данные не изменены).</div>
-      <div class="sim-banner-actions">
-        <button class="btn btn-primary btn-sm" data-action="sim-apply">Утвердить сценарий</button>
-        <button class="btn btn-outline btn-sm" data-action="sim-reset">Сбросить</button>
-      </div>
-    </div>`;
-  } else if (proj.firstGap) {
-    lastSolutions = generateSolutions(proj, 30);
-    if (lastSolutions.length) {
-      simHTML = `
-      <div class="solutions">
-        <div class="solutions-title">Готовые решения — симулятор «Что если?»</div>
-        ${lastSolutions.map((s, i) => `
-          <div class="solution-row">
-            <div class="solution-body">
-              <div class="solution-name">${esc(s.title)}</div>
-              <div class="solution-effect">${esc(s.effect)}</div>
-            </div>
-            <button class="btn btn-outline btn-sm" data-action="simulate" data-idx="${i}">Смоделировать</button>
-          </div>`).join('')}
-      </div>`;
-    }
-  }
-
   const projHTML = `
-  <div class="card">${cardTitle('chart', 'Прогноз остатков на 30 дней', simulation ? 'сценарий моделирования' : 'эффект домино: каждый проведённый документ пересчитывает график')}
-    ${svgProjection(shownProj)}
-    ${simHTML}
-    ${eventDays.length ? `<div class="table-wrap" style="margin-top:14px"><table>
-      <thead><tr><th class="num">Дата</th><th>События дня</th><th class="num">ДС на конец дня</th><th class="num">ТМЦ на конец дня</th></tr></thead>
-      <tbody>${projRows}</tbody>
-    </table></div>` : '<p style="color:var(--ink-soft);font-size:13px;margin-top:10px">Открытых плановых обязательств на горизонте нет.</p>'}
+  <div class="card">${cardTitle('chart', 'Прогноз остатков на 30 дней', 'эффект домино: каждый проведённый документ пересчитывает график')}
+    ${svgProjection(proj)}
     ${atRiskHTML}
   </div>`;
-
-  const flagsHTML = flags.length
-    ? flags.map((f) => flagItemHTML(f)).join('')
-    : `<div class="empty" style="padding:24px"><div class="empty-ico">${ic('check', 30)}</div><div class="empty-title">Флагов нет</div><p>Все обязательства исполняются в срок.</p></div>`;
 
   const events = cashflowEvents().filter((e) => e.plan);
   const horizon = addDays(today, 14);
@@ -1055,15 +1002,11 @@ function renderDashboard(flags) {
   const lastJournal = state.journal.slice(0, 4).map(journalEntryHTML).join('') ||
     `<p style="color:var(--ink-soft);font-size:13px">Документы ещё не проводились.</p>`;
 
-  return `${counterHTML}
-  ${matrixHTML}
+  return `${matrixHTML}
   ${projHTML}
-  <div class="two-col" id="dash-flags">
-    <div class="card">${cardTitle('flag', 'Красные флаги', 'материальные и денежные просрочки')}${flagsHTML}</div>
-    <div>
-      <div class="card">${cardTitle('calendar', 'Платёжный календарь', 'приоритеты: критичный · первоочередной · гибкий')}${calHTML}</div>
-      <div class="card">${cardTitle('ledger', 'Последние проведения')}${lastJournal}</div>
-    </div>
+  <div class="two-col">
+    <div class="card">${cardTitle('calendar', 'Платёжный календарь', 'приоритеты: обязательный · первоочередной · не первоочередной')}${calHTML}</div>
+    <div class="card">${cardTitle('ledger', 'Последние проведения')}${lastJournal}</div>
   </div>`;
 }
 
@@ -1496,15 +1439,20 @@ function fmtQty(q) {
   return r % 1 ? r.toFixed(Math.abs(r) < 10 ? 2 : 1) : String(r);
 }
 
-function renderPlan() {
+function renderPlan(flags) {
   const today = todayISO();
   if (!state.deals.length && !state.items.length) {
-    return `<div class="card">${emptyBlock('table', 'Оперативный план пуст',
+    return `<div class="card">${emptyBlock('table', 'Главный экран пуст',
       'Создайте сделки, номенклатуру и документы — здесь появится таблица движения ТМЦ и денег по дням, как в исходной Excel-модели.', demoButtonHTML)}</div>`;
   }
   const horizon = planHorizonDays(today);
   const proj = computeProjection(horizon);
+  // режим моделирования: Табл. 1 и ведомость показывают сценарий —
+  // «принятие решения с вводом данных онлайн отражается в табл. 1»
+  const simProj = simulation ? computeProjection(horizon, simulation) : null;
+  const shownProj = simProj || proj;
   const mode = location.hash.includes('t2') ? 't2' : 't1';
+  const heroHTML = buildMarkerHero(flags || computeFlags(), proj, liquidityMatrix(), computeItemsOutlook(30));
 
   /* Экономическая шапка: выручка по отгрузке и по оплате, себестоимость, прибыль */
   let revShipped = 0, revPaid = 0, cost = 0, costKnown = true;
@@ -1530,7 +1478,7 @@ function renderPlan() {
   </div>`;
 
   /* Платёжная ведомость на сегодня: подразделы по письму Б. */
-  const todayEvents = proj.days[0] ? proj.days[0].events.filter((e) => e.cash < 0) : [];
+  const todayEvents = shownProj.days[0] ? shownProj.days[0].events.filter((e) => e.cash < 0) : [];
   const groups = { critical: [], primary: [], other: [] };
   for (const e of todayEvents) {
     const prio = e.prio || (e.overdue ? 'critical' : 'primary');
@@ -1560,7 +1508,7 @@ function renderPlan() {
   const rowsT1 = [];
   const qtys = itemCols.map((c) => c.qty0);
   for (let i = 0; i <= horizon; i++) {
-    const d = proj.days[i];
+    const d = shownProj.days[i];
     if (!d) break;
     const inflow = sum(d.events.filter((e) => e.cash > 0).map((e) => e.cash));
     const outflow = sum(d.events.filter((e) => e.cash < 0).map((e) => e.cash));
@@ -1625,7 +1573,45 @@ function renderPlan() {
     <div class="legend" style="margin-top:8px"><span>Отклонение = факт − план; красное — план не исполнен (причина маркера). Мы не разбираем причины — мы указываем на них.</span></div>`;
   }
 
-  return `<div class="page-head">
+  /* Симулятор: баннер активного сценария либо готовые решения при разрыве.
+     Изменения видны сразу в Табл. 1 — «понимание новой реальности» */
+  let simHTML = '';
+  if (simulation && simProj) {
+    const before = proj.firstGap ? `разрыв ${fmtDate(proj.firstGap.date)} (${fmtMoney(proj.firstGap.cash)})` : 'разрыва нет';
+    const after = simProj.firstGap ? `разрыв ${fmtDate(simProj.firstGap.date)} (${fmtMoney(simProj.firstGap.cash)})` : 'разрыва нет';
+    simHTML = `
+    <div class="sim-banner" style="margin:0 0 20px">
+      <div class="sim-banner-head">Режим моделирования: ${esc(simulation.label || 'сценарий')}</div>
+      <div class="sim-banner-body">Было: ${esc(before)} → Станет: <b>${esc(after)}</b>. Табл. 1 и ведомость ниже показывают новую реальность (данные не изменены).</div>
+      <div class="sim-banner-actions">
+        <button class="btn btn-primary btn-sm" data-action="sim-apply">Утвердить сценарий</button>
+        <button class="btn btn-outline btn-sm" data-action="sim-reset">Сбросить</button>
+      </div>
+    </div>`;
+  } else if (proj.firstGap) {
+    lastSolutions = generateSolutions(proj, Math.max(horizon, 30));
+    if (lastSolutions.length) {
+      simHTML = `
+      <div class="solutions" style="margin:0 0 20px">
+        <div class="solutions-title">Готовые решения — симулятор «Что если?»</div>
+        ${lastSolutions.map((s, i) => `
+          <div class="solution-row">
+            <div class="solution-body">
+              <div class="solution-name">${esc(s.title)}</div>
+              <div class="solution-effect">${esc(s.effect)}</div>
+            </div>
+            <button class="btn btn-outline btn-sm" data-action="simulate" data-idx="${i}">Смоделировать</button>
+          </div>`).join('')}
+      </div>`;
+    }
+  }
+
+  const flagsHTML = (flags || []).length
+    ? flags.map((f) => flagItemHTML(f)).join('')
+    : `<div class="empty" style="padding:24px"><div class="empty-ico">${ic('check', 30)}</div><div class="empty-title">Флагов нет</div><p>Все обязательства исполняются в срок.</p></div>`;
+
+  return `${heroHTML}
+  <div class="page-head">
     <div class="desc">Система оперативного управления: что, когда, сколько — по каждому виду ТМЦ в натуральных единицах и по деньгам. Горизонт — до последнего исполнения обязательств (${horizon} дн.). Красные ячейки ⚑ — маркеры для управленческих решений.</div>
     <div class="spacer"></div>
     <div class="row-actions">
@@ -1634,9 +1620,11 @@ function renderPlan() {
     </div>
   </div>
   ${econHTML}
-  ${mode === 't1' ? `<div class="card">${cardTitle('table', 'Табл. 1 — движение ТМЦ и ДС по дням', 'натуральные единицы; остатки на конец дня')}${t1HTML}</div>
+  ${simHTML}
+  ${mode === 't1' ? `<div class="card">${cardTitle('table', 'Табл. 1 — движение ТМЦ и ДС по дням', simulation ? 'сценарий моделирования' : 'натуральные единицы; остатки на конец дня')}${t1HTML}</div>
   <div class="card">${cardTitle('banknote', 'Платёжная ведомость на сегодня', 'сколько и кому мы платим сегодня')}${vedomostHTML}</div>`
-  : `<div class="card">${cardTitle('table', 'Табл. 2 — план / факт / отклонение', 'почему возник маркер: план не исполнен')}${t2HTML}</div>`}`;
+  : `<div class="card">${cardTitle('table', 'Табл. 2 — план / факт / отклонение', 'почему возник маркер: план не исполнен')}${t2HTML}</div>`}
+  <div class="card" id="dash-flags">${cardTitle('flag', 'Красные флаги — причины', 'материальные и денежные просрочки')}${flagsHTML}</div>`;
 }
 
 /* ---------- Склад и номенклатура ---------- */
