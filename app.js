@@ -1538,7 +1538,8 @@ function renderPlan(flags) {
     return { item, qty0, events, planned, active: Math.abs(qty0) > 0.004 || events.length || planned.length };
   }).filter((c) => c.active);
 
-  /* Табл.1: строки-дни; ДС приток/отток/остаток + остаток каждой позиции */
+  /* Табл.1: строки-дни; ДС приток/отток/остаток + по каждой позиции
+     Приход / Расход / Остаток — как в исходном Excel «График движения материалов» */
   const rowsT1 = [];
   const qtys = itemCols.map((c) => c.qty0);
   for (let i = 0; i <= horizon; i++) {
@@ -1546,22 +1547,21 @@ function renderPlan(flags) {
     if (!d) break;
     const inflow = sum(d.events.filter((e) => e.cash > 0).map((e) => e.cash));
     const outflow = sum(d.events.filter((e) => e.cash < 0).map((e) => e.cash));
-    const deltas = itemCols.map((c) => sum(c.events.filter((e) => e.date === d.date).map((e) => e.qty)));
-    itemCols.forEach((c, j) => { qtys[j] += deltas[j]; });
+    const dayIn = itemCols.map((c) => sum(c.events.filter((e) => e.date === d.date && e.qty > 0).map((e) => e.qty)));
+    const dayOut = itemCols.map((c) => -sum(c.events.filter((e) => e.date === d.date && e.qty < 0).map((e) => e.qty)));
+    itemCols.forEach((c, j) => { qtys[j] += dayIn[j] - dayOut[j]; });
     const hasActivity = inflow || outflow || d.cashGap ||
-      deltas.some((x) => Math.abs(x) > 0.004) || i === 0;
+      dayIn.some((x) => x > 0.004) || dayOut.some((x) => x > 0.004) || i === 0;
     rowsT1.push(`<tr class="${hasActivity ? '' : 'row-quiet'}">
       <td class="num">${i}</td>
       <td class="num">${fmtDate(d.date)}</td>
       <td class="num">${inflow ? '+' + fmtMoney(inflow) : ''}</td>
       <td class="num">${outflow ? '−' + fmtMoney(-outflow) : ''}</td>
       <td class="num ${d.cashGap ? 'neg-cell' : ''}">${fmtMoney(d.cash)}${d.cashGap ? ' ⚑' : ''}</td>
-      ${itemCols.map((c, j) => {
-        const dl = deltas[j];
-        const dlHTML = Math.abs(dl) > 0.004
-          ? ` <span class="pt-delta ${dl > 0 ? 'pos' : 'neg'}">${dl > 0 ? '+' : '−'}${fmtQty(Math.abs(dl))}</span>` : '';
-        return `<td class="num ${qtys[j] < -0.004 ? 'neg-cell' : ''}">${fmtQty(qtys[j])}${dlHTML}${qtys[j] < -0.004 ? ' ⚑' : ''}</td>`;
-      }).join('')}
+      ${itemCols.map((c, j) => `
+        <td class="num col-sep">${dayIn[j] > 0.004 ? '<span class="pt-delta pos">+' + fmtQty(dayIn[j]) + '</span>' : ''}</td>
+        <td class="num">${dayOut[j] > 0.004 ? '<span class="pt-delta neg">−' + fmtQty(dayOut[j]) + '</span>' : ''}</td>
+        <td class="num ${qtys[j] < -0.004 ? 'neg-cell' : ''}">${fmtQty(qtys[j])}${qtys[j] < -0.004 ? ' ⚑' : ''}</td>`).join('')}
     </tr>`);
   }
   const t1HTML = `
@@ -1569,8 +1569,9 @@ function renderPlan(flags) {
     <thead>
       <tr><th class="num" rowspan="2">№</th><th class="num" rowspan="2">Дата</th>
         <th colspan="3" style="text-align:center">Денежные средства, ₽</th>
-        ${itemCols.map((c) => `<th class="num" rowspan="2" title="${esc(c.item.name)}">${esc(c.item.sku)}, ${esc(c.item.unit)}</th>`).join('')}</tr>
-      <tr><th class="num">Приток</th><th class="num">Отток</th><th class="num">Остаток</th></tr>
+        ${itemCols.map((c) => `<th colspan="3" class="col-sep" style="text-align:center" title="${esc(c.item.name)}">${esc(c.item.sku)}, ${esc(c.item.unit)}</th>`).join('')}</tr>
+      <tr><th class="num">Приток</th><th class="num">Отток</th><th class="num">Остаток</th>
+        ${itemCols.map(() => '<th class="num col-sep">Приход</th><th class="num">Расход</th><th class="num">Остаток</th>').join('')}</tr>
     </thead>
     <tbody>${rowsT1.join('')}</tbody>
   </table></div>`;
