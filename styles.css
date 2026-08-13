@@ -262,6 +262,9 @@ body {
 .plan-table tr.row-quiet { opacity: .55; }
 .plan-table tr.row-today td { background: var(--amber-soft); }
 .plan-table .neg-cell { background: var(--red-soft); }
+.pt-delta { font-size: 10px; }
+.pt-delta.pos { color: var(--green); }
+.pt-delta.neg { color: var(--red); }
 
 /* ============ Выручка в двух разрезах ============ */
 .rev-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 0; border: 1px solid var(--rule-mid); }

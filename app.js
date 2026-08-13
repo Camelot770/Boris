@@ -140,6 +140,25 @@ function nextScheduleDate(scheduleDays, from) {
   return null;
 }
 
+/* Плановые затраты на логистику/таможню из юр. блока сделки: отток на дату
+   ближайшего ожидаемого получения ТМЦ (пока поставка по сделке не закрыта). */
+function logisticsPlanEvents(today) {
+  const out = [];
+  for (const deal of state.deals) {
+    if (deal.kind !== 'purchase' || !(deal.logisticsCost > 0)) continue;
+    const open = materialRegister(deal).open;
+    let date = open.length ? open[0].date : null;
+    if (!date && deal.scheduleDays) {
+      const nd = nextScheduleDate(deal.scheduleDays, today);
+      if (nd) date = addDays(nd, deal.deliveryDays || 0);
+    }
+    if (!date) continue;
+    if (date < today) date = today;
+    out.push({ date, amount: deal.logisticsCost, deal });
+  }
+  return out;
+}
+
 /* Вхождения прочего платежа в горизонте (повторяющиеся разворачиваются на лету).
    Ежемесячные считаются от базовой даты с зажимом дня месяца (31-е → 28/30-е),
    без дрейфа при переходе через короткие месяцы. */
@@ -349,6 +368,12 @@ function cashflowEvents() {
   }
   // прочие платежи: ближайшие 60 дней, со своим приоритетом
   const today = todayISO();
+  for (const lg of logisticsPlanEvents(today)) {
+    if (lg.date <= addDays(today, 60)) {
+      events.push({ date: lg.date, amount: -lg.amount, plan: true,
+        label: `Логистика и таможня · ${lg.deal.counterparty}`, dir: 'out', prio: 'primary' });
+    }
+  }
   for (const p of state.otherPayments) {
     const cat = OTHER_CATEGORIES[p.category] || OTHER_CATEGORIES.other;
     const overdueOnce = p.recurring !== 'monthly' && p.date < today;
@@ -409,6 +434,10 @@ function liquidityMatrix() {
   for (const p of state.otherPayments) {
     dsOut += p.amount * otherPaymentOccurrences(p, today, horizonEnd).length;
   }
+  // плановая логистика по открытым поставкам
+  for (const lg of logisticsPlanEvents(today)) {
+    if (lg.date <= horizonEnd) dsOut += lg.amount;
+  }
   return {
     ds: { have: bal.cash, in: dsIn, out: dsOut, need: Math.max(0, dsOut - (bal.cash + dsIn)) },
     tmc: { have: bal.stock, in: tmcIn, out: tmcOut, need: Math.max(0, tmcOut - (bal.stock + tmcIn)) },
@@ -460,6 +489,11 @@ function computeProjection(horizon = 30, sim = null) {
         else events.push({ date: o.date, cash: 0, stock: o.left, label: `Поставка ${deal.counterparty} (${o.ref})` });
       }
     }
+  }
+  // логистика/таможня из юр. блока сделок — на дату ожидаемого получения
+  for (const lg of logisticsPlanEvents(today)) {
+    events.push({ date: lg.date, cash: -lg.amount, stock: 0,
+      label: `Логистика и таможня: ${lg.deal.counterparty}`, prio: 'primary' });
   }
   // прочие платежи (вне сделок): аренда, налоги, зарплата, дискреционные
   for (const p of state.otherPayments) {
@@ -1512,16 +1546,22 @@ function renderPlan(flags) {
     if (!d) break;
     const inflow = sum(d.events.filter((e) => e.cash > 0).map((e) => e.cash));
     const outflow = sum(d.events.filter((e) => e.cash < 0).map((e) => e.cash));
-    itemCols.forEach((c, j) => { qtys[j] += sum(c.events.filter((e) => e.date === d.date).map((e) => e.qty)); });
+    const deltas = itemCols.map((c) => sum(c.events.filter((e) => e.date === d.date).map((e) => e.qty)));
+    itemCols.forEach((c, j) => { qtys[j] += deltas[j]; });
     const hasActivity = inflow || outflow || d.cashGap ||
-      itemCols.some((c, j) => c.events.some((e) => e.date === d.date)) || i === 0;
+      deltas.some((x) => Math.abs(x) > 0.004) || i === 0;
     rowsT1.push(`<tr class="${hasActivity ? '' : 'row-quiet'}">
       <td class="num">${i}</td>
       <td class="num">${fmtDate(d.date)}</td>
       <td class="num">${inflow ? '+' + fmtMoney(inflow) : ''}</td>
       <td class="num">${outflow ? '−' + fmtMoney(-outflow) : ''}</td>
       <td class="num ${d.cashGap ? 'neg-cell' : ''}">${fmtMoney(d.cash)}${d.cashGap ? ' ⚑' : ''}</td>
-      ${itemCols.map((c, j) => `<td class="num ${qtys[j] < -0.004 ? 'neg-cell' : ''}">${fmtQty(qtys[j])}${qtys[j] < -0.004 ? ' ⚑' : ''}</td>`).join('')}
+      ${itemCols.map((c, j) => {
+        const dl = deltas[j];
+        const dlHTML = Math.abs(dl) > 0.004
+          ? ` <span class="pt-delta ${dl > 0 ? 'pos' : 'neg'}">${dl > 0 ? '+' : '−'}${fmtQty(Math.abs(dl))}</span>` : '';
+        return `<td class="num ${qtys[j] < -0.004 ? 'neg-cell' : ''}">${fmtQty(qtys[j])}${dlHTML}${qtys[j] < -0.004 ? ' ⚑' : ''}</td>`;
+      }).join('')}
     </tr>`);
   }
   const t1HTML = `
@@ -2116,6 +2156,9 @@ function openDealForm(id) {
       <div class="field"><label>График по договору, дни месяца</label>
         <input name="scheduleDays" value="${d ? esc(d.scheduleDays || '') : ''}" placeholder="напр.: 5, 20">
         <div class="note">Юридический блок: регулярные отгрузки/поставки (например, 5-го и 20-го числа). Планирует остаток обязательств, пока нет документов.</div></div>
+      <div class="field"><label>Доп. затраты на логистику/таможню, ₽</label>
+        <input name="logisticsCost" type="number" min="0" step="0.01" value="${d ? d.logisticsCost || '' : ''}">
+        <div class="note">Для закупок: плановый отток на дату ближайшего получения ТМЦ, пока поставка не закрыта.</div></div>
       <div class="field full"><label>Комментарий</label>
         <input name="comment" value="${d ? esc(d.comment || '') : ''}"></div>
       <div class="form-actions full">
@@ -2146,6 +2189,7 @@ function openDealForm(id) {
       rec.deferDays = Math.max(0, parseInt(f.get('deferDays'), 10) || 0);
       rec.deliveryDays = Math.max(0, parseInt(f.get('deliveryDays'), 10) || 0);
       rec.scheduleDays = f.get('scheduleDays').trim();
+      rec.logisticsCost = Math.max(0, parseFloat(f.get('logisticsCost')) || 0);
       rec.comment = f.get('comment').trim();
       if (!d) state.deals.push(rec);
       // направление привязанных документов следует за типом сделки
@@ -2364,7 +2408,7 @@ function loadDemo() {
   const dTehno = { id: uuid(), name: 'Договор продажи №7', counterparty: 'ООО «ТехноДом»', kind: 'sale', amount: 560000, shipDays: 3, deferDays: 20, comment: 'Отсрочка 20 дней после отгрузки', lines: [{ itemId: iKond.id, qty: 8, price: 70000 }] };
   const dStroy = { id: uuid(), name: 'Договор продажи №11', counterparty: 'ООО «СтройГрад»', kind: 'sale', amount: 650000, shipDays: 3, deferDays: 14, comment: 'Отсрочка 14 дней после отгрузки', lines: [{ itemId: iFbs.id, qty: 100, price: 6500 }] };
   // обязательство только из юр. блока: график поставок 5-го и 20-го, доставка 2 дня
-  const dFuel = { id: uuid(), name: 'Договор поставки топлива', counterparty: 'ООО «НефтеТрейд»', kind: 'purchase', amount: 124000, shipDays: 0, deferDays: 10, deliveryDays: 2, scheduleDays: '5, 20', comment: 'Поставки 5-го и 20-го числа, доставка 2 дня', lines: [{ itemId: iFuel.id, qty: 2000, price: 62 }] };
+  const dFuel = { id: uuid(), name: 'Договор поставки топлива', counterparty: 'ООО «НефтеТрейд»', kind: 'purchase', amount: 124000, shipDays: 0, deferDays: 10, deliveryDays: 2, scheduleDays: '5, 20', logisticsCost: 18000, comment: 'Поставки 5-го и 20-го числа, доставка 2 дня, логистика 18 000 ₽', lines: [{ itemId: iFuel.id, qty: 2000, price: 62 }] };
 
   // живые остатки: разрыв возникает в будущем — виден заранее, симулятор предложит решения
   state = {
@@ -2469,6 +2513,7 @@ function sanitizeImported(s) {
       deferDays: Math.max(0, parseInt(d.deferDays, 10) || 0),
       deliveryDays: Math.max(0, parseInt(d.deliveryDays, 10) || 0),
       scheduleDays: str(d.scheduleDays),
+      logisticsCost: typeof d.logisticsCost === 'number' && isFinite(d.logisticsCost) && d.logisticsCost > 0 ? d.logisticsCost : 0,
       comment: str(d.comment),
       _srcLines: d.lines,
     }));
