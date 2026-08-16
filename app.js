@@ -1564,7 +1564,18 @@ function renderPlan(flags) {
         <td class="num ${qtys[j] < -0.004 ? 'neg-cell' : ''}">${fmtQty(qtys[j])}${qtys[j] < -0.004 ? ' ⚑' : ''}</td>`).join('')}
     </tr>`);
   }
-  const t1HTML = `
+  /* Явная подсказка, когда товарных колонок нет: без номенклатуры и
+     спецификаций в документах товарный поток показать не из чего */
+  const noItemsHint = !itemCols.length
+    ? `<div class="callout callout-blue" style="margin-bottom:12px">
+        <b>Товарные колонки пока не видны.</b> Чтобы Табл. 1 показывала поток ТМЦ в натуральных единицах:
+        1) создайте позиции в разделе <a href="#/stock">«Склад и номенклатура»</a>;
+        2) в сделках и накладных заполните блок «Спецификация по позициям» (позиция × количество × цена).
+        После этого по каждому артикулу появятся колонки Приход / Расход / Остаток.
+       </div>`
+    : '';
+
+  const t1HTML = `${noItemsHint}
   <div class="table-wrap"><table class="plan-table">
     <thead>
       <tr><th class="num" rowspan="2">№</th><th class="num" rowspan="2">Дата</th>
