@@ -676,8 +676,16 @@ function itemMovements(itemId) {
 function itemPlanMoves(itemId, today) {
   const plans = [];
   for (const deal of state.deals) {
-    if (!Array.isArray(deal.lines)) continue;
-    const plannedQty = sum(deal.lines.filter((l) => l.itemId === itemId).map((l) => l.qty));
+    // плановые количества: спецификация сделки, а если её нет —
+    // строки проведённых платёжных документов этой сделки
+    let plannedQty = Array.isArray(deal.lines)
+      ? sum(deal.lines.filter((l) => l.itemId === itemId).map((l) => l.qty)) : 0;
+    if (plannedQty <= 0) {
+      for (const pd of state.payments) {
+        if (!pd.posted || pd.dealId !== deal.id || !Array.isArray(pd.lines)) continue;
+        plannedQty += sum(pd.lines.filter((l) => l.itemId === itemId).map((l) => l.qty));
+      }
+    }
     if (plannedQty <= 0) continue;
     let factQty = 0;
     for (const w of state.waybills) {
@@ -1350,7 +1358,7 @@ function renderDeals() {
   const rows = state.deals.map((d) => {
     const a = dealAggregates(d);
     return `<tr>
-      <td><div class="cell-main">${esc(d.name)}</div><div class="cell-sub">${esc(d.counterparty)}</div></td>
+      <td><div class="cell-main">${esc(d.name)}</div><div class="cell-sub">${esc(d.counterparty)}${linesSummary(d.lines) ? ' · ' + esc(linesSummary(d.lines)) : ''}</div></td>
       <td><span class="badge ${d.kind === 'sale' ? 'badge-green' : 'badge-blue'}">${DEAL_KIND[d.kind].label}</span></td>
       <td class="uuid" data-action="copy-uuid" data-id="${esc(d.id)}" title="Скопировать полный UUID">${esc(shortId(d.id))}…</td>
       <td class="num">${fmtMoney(d.amount)}</td>
@@ -1366,7 +1374,7 @@ function renderDeals() {
   }).join('');
 
   return `<div class="page-head">
-    <div class="desc">Сделка = договор со связкой <code style="font-family:var(--mono)">ID_Deal (UUID)</code>. Юридический блок задаёт два срока: поставка/отгрузка после оплаты и отсрочка платежа после перемещения ТМЦ — из них автоматически считаются плановые даты в документах.</div>
+    <div class="desc">Сделка не вводится отдельной статьёй — она <b>формируется из накладных и платёжных документов</b> («+ Новая сделка» прямо в форме документа). Здесь — реестр договоров и юрблок: сроки поставки и отсрочки, график («5, 20»), доставка, логистика; из них считаются плановые даты.</div>
     <div class="spacer"></div>
     <button class="btn btn-primary" data-action="new-deal">+ Новая сделка</button>
   </div>
@@ -1374,7 +1382,7 @@ function renderDeals() {
   ${state.deals.length ? `<table>
     <thead><tr><th>Сделка</th><th>Тип</th><th>ID_Deal</th><th class="num">Сумма</th><th class="num">Срок ТМЦ</th><th class="num">Отсрочка</th><th class="num">Оплачено</th><th class="num">Перемещено</th><th></th></tr></thead>
     <tbody>${rows}</tbody></table>`
-    : emptyBlock('deal', 'Сделок нет', 'Создайте первую сделку — документы привязываются к ней через ID_Deal.', demoButtonHTML)}
+    : emptyBlock('deal', 'Сделок нет', 'Сделки формируются автоматически из платёжек и накладных — создайте документ, и связка ID_Deal появится здесь. Можно создать договор и вручную.', demoButtonHTML)}
   </div></div>`;
 }
 
@@ -1383,7 +1391,7 @@ function renderPayments() {
   const rows = [...state.payments].sort((a, b) => b.datePaymentExecution.localeCompare(a.datePaymentExecution)).map((p) => {
     const deal = dealById(p.dealId);
     return `<tr>
-      <td><div class="cell-main">${esc(p.num)}</div><div class="cell-sub">${deal ? esc(dealTitle(deal)) : '—'}</div></td>
+      <td><div class="cell-main">${esc(p.num)}</div><div class="cell-sub">${deal ? esc(dealTitle(deal)) : '—'}${linesSummary(p.lines) ? ' · ' + esc(linesSummary(p.lines)) : ''}</div></td>
       <td><span class="badge ${p.kind === 'in' ? 'badge-green' : 'badge-amber'}">${PAY_KIND[p.kind]}</span></td>
       <td class="num">${fmtMoney(p.amount)}</td>
       <td class="num">${fmtDate(p.datePaymentExecution)}</td>
@@ -1408,7 +1416,7 @@ function renderPayments() {
   ${state.payments.length ? `<table>
     <thead><tr><th>Документ</th><th>Тип</th><th class="num">Сумма</th><th class="num">Оплата (факт)</th><th class="num">ТМЦ (план)</th><th>Статус</th><th></th></tr></thead>
     <tbody>${rows}</tbody></table>`
-    : emptyBlock('card', 'Платёжных документов нет', state.deals.length ? 'Создайте платёжный документ по сделке.' : 'Сначала создайте сделку — платёжка привязывается через ID_Deal.')}
+    : emptyBlock('card', 'Платёжных документов нет', 'Создайте платёжный документ — сделка (ID_Deal) сформируется прямо из формы. Спецификация позиций даст плановый приход ТМЦ в натуре.')}
   </div></div>`;
 }
 
@@ -1417,7 +1425,7 @@ function renderWaybills() {
   const rows = [...state.waybills].sort((a, b) => b.dateMaterialFact.localeCompare(a.dateMaterialFact)).map((w) => {
     const deal = dealById(w.dealId);
     return `<tr>
-      <td><div class="cell-main">${esc(w.num)}</div><div class="cell-sub">${deal ? esc(dealTitle(deal)) : '—'}${w.goods ? ' · ' + esc(w.goods) : ''}</div></td>
+      <td><div class="cell-main">${esc(w.num)}</div><div class="cell-sub">${deal ? esc(dealTitle(deal)) : '—'} · ${linesSummary(w.lines) ? esc(linesSummary(w.lines)) : (w.goods ? esc(w.goods) : 'без спецификации')}</div></td>
       <td><span class="badge ${w.kind === 'in' ? 'badge-blue' : 'badge-amber'}">${WB_KIND[w.kind]}</span></td>
       <td>${w.isReal ? '<span class="badge badge-green">Реальная</span>' : '<span class="badge badge-grey">Виртуальная</span>'}</td>
       <td class="num">${fmtMoney(w.amount)}</td>
@@ -1443,7 +1451,7 @@ function renderWaybills() {
   ${state.waybills.length ? `<table>
     <thead><tr><th>Документ</th><th>Тип</th><th>Is_Real</th><th class="num">Сумма</th><th class="num">ТМЦ (факт)</th><th class="num">Оплата (план)</th><th>Статус</th><th></th></tr></thead>
     <tbody>${rows}</tbody></table>`
-    : emptyBlock('box', 'Накладных нет', state.deals.length ? 'Создайте накладную по сделке.' : 'Сначала создайте сделку — накладная привязывается через ID_Deal.')}
+    : emptyBlock('box', 'Накладных нет', 'Создайте накладную — сделка (ID_Deal) сформируется прямо из формы. Спецификация позиций даст фактическое движение ТМЦ в натуре.')}
   </div></div>`;
 }
 
@@ -2123,6 +2131,7 @@ function renderHelp() {
       <li><b>Маркер дефицита</b> — по каждому артикулу строится прогноз остатка на 30 дней с учётом обязательств по отгрузке и ожидаемых поставок; уход в минус подсвечивается красным и попадает в счётчик маркеров.</li>
       <li><b>Залежалые остатки</b> — позиции без движения дольше норматива подсвечиваются как «замороженные» деньги, съедающие оборотный капитал.</li>
       <li><b>Прочие платежи</b> — аренда, налоги, зарплата и другие обязательства вне сделок, разовые и ежемесячные. Входят в матрицу «Мы должны», прогноз разрывов и платёжный календарь со своим приоритетом.</li>
+      <li><b>Сделка формируется из первички.</b> Отдельной статьёй сделка не вводится: «+ Новая сделка» создаётся прямо из формы платёжки или накладной, а в реестре договоров дозаполняется юрблок. Спецификация (позиция × количество × цена, ед. измерения — из номенклатуры) есть во всех трёх документах: строки платёжек формируют плановый приход в натуре, строки накладных — факт.</li>
     </ul>
     <div class="callout callout-grey">Этап 2 (бэкенд): интеграция с банком (выписки) и ЭДО (первичка), совместная работа ролей — снабженец, продавец, бухгалтер — с общей базой.</div>
     <div class="callout callout-grey">Данные хранятся локально в браузере (localStorage). «Экспорт» выгружает всё в JSON, «Импорт» — восстанавливает.</div>
@@ -2135,7 +2144,78 @@ function renderHelp() {
 
 function dealOptions(selectedId) {
   return state.deals.map((d) =>
-    `<option value="${esc(d.id)}" ${d.id === selectedId ? 'selected' : ''}>${esc(dealTitle(d))} — ${DEAL_KIND[d.kind].label}</option>`).join('');
+    `<option value="${esc(d.id)}" ${d.id === selectedId ? 'selected' : ''}>${esc(dealTitle(d))} — ${DEAL_KIND[d.kind].label}</option>`).join('') +
+    `<option value="__new__" ${selectedId === '__new__' ? 'selected' : ''}>+ Новая сделка (создать из документа)…</option>`;
+}
+
+/* Блок «новая сделка из документа»: сделка не вводится отдельной статьёй —
+   она формируется из накладных и платёжных документов (замечание Б.) */
+function newDealBoxHTML(defaultKind) {
+  return `<div id="ndBox" class="field full" hidden>
+    <div class="callout callout-blue" style="margin:0">
+      <b>Новая сделка сформируется автоматически при сохранении документа.</b>
+      <div class="form-grid" style="margin-top:10px">
+        <div class="field"><label>Контрагент <span class="req">*</span></label>
+          <input id="ndCounterparty" placeholder="ООО «Ромашка»"></div>
+        <div class="field"><label>Тип сделки</label>
+          <select id="ndKind">
+            <option value="purchase" ${defaultKind === 'purchase' ? 'selected' : ''}>Закупка (нам поставляют)</option>
+            <option value="sale" ${defaultKind === 'sale' ? 'selected' : ''}>Продажа (мы отгружаем)</option>
+          </select></div>
+        <div class="field"><label>Срок перемещения ТМЦ после оплаты, дн</label>
+          <input id="ndShip" type="number" min="0" step="1" value="5"></div>
+        <div class="field"><label>Отсрочка платежа после ТМЦ, дн</label>
+          <input id="ndDefer" type="number" min="0" step="1" value="10"></div>
+      </div>
+      <div class="note" style="margin-top:8px">Условия юрблока (график, доставка, логистика) можно дозаполнить потом в разделе «Договоры (сделки)».</div>
+    </div>
+  </div>`;
+}
+
+function mountNewDeal(body, onToggle) {
+  const fDeal = body.querySelector('#fDeal');
+  const box = body.querySelector('#ndBox');
+  if (!fDeal || !box) return { active: () => false, pseudoDeal: () => null, create: () => null };
+  // первичная синхронизация без колбэка: nd ещё в инициализации (TDZ)
+  const syncBox = (fire) => {
+    const on = fDeal.value === '__new__';
+    box.hidden = !on;
+    if (fire && onToggle) onToggle(on);
+  };
+  fDeal.addEventListener('change', () => syncBox(true));
+  syncBox(false);
+  const pseudoDeal = () => ({
+    kind: body.querySelector('#ndKind').value,
+    counterparty: body.querySelector('#ndCounterparty').value.trim(),
+    shipDays: Math.max(0, parseInt(body.querySelector('#ndShip').value, 10) || 0),
+    deferDays: Math.max(0, parseInt(body.querySelector('#ndDefer').value, 10) || 0),
+    deliveryDays: 0,
+  });
+  return {
+    active: () => fDeal.value === '__new__',
+    pseudoDeal,
+    create: (docNum, docAmount) => {
+      const pd = pseudoDeal();
+      if (!pd.counterparty) return null;
+      const deal = {
+        id: uuid(), name: 'Договор с ' + pd.counterparty, counterparty: pd.counterparty,
+        kind: pd.kind, amount: docAmount || 0, shipDays: pd.shipDays, deferDays: pd.deferDays,
+        deliveryDays: 0, scheduleDays: '', logisticsCost: 0, lines: [],
+        comment: 'Сформирована автоматически из документа ' + docNum,
+      };
+      state.deals.push(deal);
+      return deal;
+    },
+  };
+}
+
+/* Краткое описание спецификации для списков документов */
+function linesSummary(lines) {
+  if (!Array.isArray(lines) || !lines.length) return '';
+  return lines.map((l) => {
+    const it = itemById(l.itemId);
+    return it ? `${it.sku}×${fmtQty(l.qty)} ${it.unit}` : '';
+  }).filter(Boolean).join(' · ');
 }
 
 function openDealForm(id) {
@@ -2215,8 +2295,7 @@ function openDealForm(id) {
 
 function openPaymentForm(id) {
   const p = id ? state.payments.find((x) => x.id === id) : null;
-  if (!state.deals.length) { showToast('Сначала создайте сделку', ['Платёжный документ привязывается через ID_Deal'], 'red'); return; }
-  const defaults = p || { dealId: state.deals[0].id, amount: '', datePaymentExecution: todayISO(), num: nextNum(state.payments, 'ПП') };
+  const defaults = p || { dealId: state.deals[0] ? state.deals[0].id : '__new__', amount: '', datePaymentExecution: todayISO(), num: nextNum(state.payments, 'ПП') };
 
   openModal(p ? 'Платёжный документ ' + p.num : 'Новый платёжный документ', `
     <form id="frm" class="form-grid">
@@ -2227,6 +2306,8 @@ function openPaymentForm(id) {
         <div class="note" id="fKindNote"></div></div>
       <div class="field"><label>Сумма, ₽ <span class="req">*</span></label>
         <input name="amount" id="fAmount" type="number" min="0.01" step="0.01" required value="${defaults.amount}"></div>
+      ${newDealBoxHTML('purchase')}
+      ${linesEditorHTML(p ? p.lines : null)}
       <div class="field"><label>Date_Payment_Execution — факт оплаты <span class="req">*</span></label>
         <input name="datePaymentExecution" id="fPayDate" type="date" required max="${todayISO()}" value="${defaults.datePaymentExecution}">
         <div class="note">Входящие — дата зачисления на счёт, исходящие — дата списания банком. Факт не может быть в будущем.</div></div>
@@ -2245,10 +2326,12 @@ function openPaymentForm(id) {
     const fMatPlan = body.querySelector('#fMatPlan');
     const note = body.querySelector('#fMatPlanNote');
     const kindNote = body.querySelector('#fKindNote');
+    const linesEd = mountLinesEditor(body, body.querySelector('#fAmount'));
     let manual = !!p; // при редактировании не перетираем сохранённое, пока не изменят входные данные
 
+    const resolveDeal = () => (fDeal.value === '__new__' ? nd.pseudoDeal() : dealById(fDeal.value));
     const recalc = (force) => {
-      const deal = dealById(fDeal.value);
+      const deal = resolveDeal();
       kindNote.textContent = deal ? 'Тип: ' + DEAL_KIND[deal.kind].payLabel : '';
       if (!deal || !fPayDate.value) return;
       if (force || !manual) {
@@ -2258,6 +2341,8 @@ function openPaymentForm(id) {
         manual = false;
       }
     };
+    const nd = mountNewDeal(body, () => recalc(true));
+    body.querySelector('#ndBox').addEventListener('input', () => recalc(true));
     fDeal.addEventListener('change', () => recalc(true));
     fPayDate.addEventListener('change', () => recalc(true));
     fMatPlan.addEventListener('input', () => { manual = true; note.textContent = 'Указано вручную (перекрывает расчёт из договора).'; });
@@ -2267,18 +2352,24 @@ function openPaymentForm(id) {
     body.querySelector('#frm').addEventListener('submit', (e) => {
       e.preventDefault();
       const f = new FormData(e.target);
-      const deal = dealById(f.get('dealId'));
-      if (!deal) return;
       const rec = p || { id: uuid(), posted: false };
       const num = f.get('num').trim() || nextNum(state.payments, 'ПП');
       if (state.payments.some((x) => x.num === num && x.id !== rec.id)) {
         showToast('Номер уже занят', [`Платёжный документ ${num} существует — укажите другой номер`], 'red'); return;
       }
-      const amount = parseFloat(f.get('amount')) || 0;
-      if (amount <= 0) { showToast('Сумма должна быть больше нуля', [], 'red'); return; }
+      const lines = linesEd.getLines();
+      const amount = lines.length ? sum(lines.map((l) => l.qty * l.price)) : (parseFloat(f.get('amount')) || 0);
+      if (amount <= 0) { showToast('Сумма должна быть больше нуля', ['Проверьте строки спецификации: нужны позиция, количество и цена больше нуля'], 'red'); return; }
+      let deal = fDeal.value === '__new__' ? null : dealById(f.get('dealId'));
+      if (!deal && nd.active()) {
+        deal = nd.create(num, amount);
+        if (!deal) { showToast('Укажите контрагента новой сделки', [], 'red'); return; }
+      }
+      if (!deal) return;
       rec.num = num;
       rec.dealId = deal.id;
       rec.kind = DEAL_KIND[deal.kind].payKind;
+      rec.lines = lines;
       rec.amount = amount;
       rec.datePaymentExecution = f.get('datePaymentExecution');
       rec.dateMaterialPlan = f.get('dateMaterialPlan') || addDays(rec.datePaymentExecution, deal.shipDays + (deal.deliveryDays || 0));
@@ -2293,8 +2384,7 @@ function openPaymentForm(id) {
 
 function openWaybillForm(id) {
   const w = id ? state.waybills.find((x) => x.id === id) : null;
-  if (!state.deals.length) { showToast('Сначала создайте сделку', ['Накладная привязывается через ID_Deal'], 'red'); return; }
-  const defaults = w || { dealId: state.deals[0].id, amount: '', dateMaterialFact: todayISO(), num: nextNum(state.waybills, 'НК'), isReal: true, goods: '' };
+  const defaults = w || { dealId: state.deals[0] ? state.deals[0].id : '__new__', amount: '', dateMaterialFact: todayISO(), num: nextNum(state.waybills, 'НК'), isReal: true, goods: '' };
 
   openModal(w ? 'Накладная ' + w.num : 'Новая накладная', `
     <form id="frm" class="form-grid">
@@ -2307,6 +2397,7 @@ function openWaybillForm(id) {
         <input name="amount" id="fWbAmount" type="number" min="0.01" step="0.01" required value="${defaults.amount}"></div>
       <div class="field"><label>Состав ТМЦ (текстом)</label>
         <input name="goods" value="${esc(defaults.goods || '')}" placeholder="металлопрокат, 12 т"></div>
+      ${newDealBoxHTML('sale')}
       ${linesEditorHTML(w ? w.lines : null)}
       <div class="field"><label>Date_Material_Execution_Fact — факт перемещения <span class="req">*</span></label>
         <input name="dateMaterialFact" id="fFactDate" type="date" required max="${todayISO()}" value="${defaults.dateMaterialFact}">
@@ -2338,6 +2429,8 @@ function openWaybillForm(id) {
     const linesEd = mountLinesEditor(body, body.querySelector('#fWbAmount'));
     let manual = !!w;
 
+    const resolveDeal = () => (fDeal.value === '__new__' ? nd.pseudoDeal() : dealById(fDeal.value));
+
     const syncReal = () => {
       const on = fReal.checked;
       body.querySelector('.check-title').textContent = 'Is_Real — реальность действия: ' + (on ? 'ДА' : 'НЕТ');
@@ -2348,7 +2441,7 @@ function openWaybillForm(id) {
       fPlan.disabled = !on;
     };
     const recalc = (force) => {
-      const deal = dealById(fDeal.value);
+      const deal = resolveDeal();
       kindNote.textContent = deal ? 'Тип: ' + DEAL_KIND[deal.kind].wbLabel : '';
       if (!deal || !fFact.value) return;
       if (force || !manual) {
@@ -2357,6 +2450,8 @@ function openWaybillForm(id) {
         manual = false;
       }
     };
+    const nd = mountNewDeal(body, () => recalc(true));
+    body.querySelector('#ndBox').addEventListener('input', () => recalc(true));
     fDeal.addEventListener('change', () => recalc(true));
     fFact.addEventListener('change', () => recalc(true));
     fPlan.addEventListener('input', () => { manual = true; note.textContent = 'Указано вручную (перекрывает расчёт из договора).'; });
@@ -2367,8 +2462,6 @@ function openWaybillForm(id) {
     body.querySelector('#frm').addEventListener('submit', (e) => {
       e.preventDefault();
       const f = new FormData(e.target);
-      const deal = dealById(f.get('dealId'));
-      if (!deal) return;
       const rec = w || { id: uuid(), posted: false };
       const num = f.get('num').trim() || nextNum(state.waybills, 'НК');
       if (state.waybills.some((x) => x.num === num && x.id !== rec.id)) {
@@ -2378,6 +2471,12 @@ function openWaybillForm(id) {
       const lines = linesEd.getLines();
       const amount = lines.length ? sum(lines.map((l) => l.qty * l.price)) : (parseFloat(f.get('amount')) || 0);
       if (amount <= 0) { showToast('Сумма должна быть больше нуля', ['Проверьте строки спецификации: нужны позиция, количество и цена больше нуля'], 'red'); return; }
+      let deal = fDeal.value === '__new__' ? null : dealById(f.get('dealId'));
+      if (!deal && nd.active()) {
+        deal = nd.create(num, amount);
+        if (!deal) { showToast('Укажите контрагента новой сделки', [], 'red'); return; }
+      }
+      if (!deal) return;
       rec.num = num;
       rec.dealId = deal.id;
       rec.kind = DEAL_KIND[deal.kind].wbKind;
@@ -2436,11 +2535,11 @@ function loadDemo() {
     settings: { cashOpening: 300000, stockOpening: 400000 },
   };
 
-  const mkPay = (deal, num, amount, dayOffset) => ({
+  const mkPay = (deal, num, amount, dayOffset, lines) => ({
     id: uuid(), num, dealId: deal.id, kind: DEAL_KIND[deal.kind].payKind, amount,
     datePaymentExecution: addDays(T, dayOffset),
     dateMaterialPlan: addDays(addDays(T, dayOffset), deal.shipDays + (deal.deliveryDays || 0)),
-    comment: '', posted: false,
+    comment: '', posted: false, lines: lines || [],
   });
   const mkWb = (deal, num, amount, dayOffset, isReal, goods, lines) => ({
     id: uuid(), num, dealId: deal.id, kind: DEAL_KIND[deal.kind].wbKind, amount,
@@ -2452,10 +2551,10 @@ function loadDemo() {
 
   // Ромашка (продажа): аванс 12 дней назад → план отгрузки −7 дн.; отгружено 25 из 40 шт с опозданием
   // → к отгрузке 15 шт при складе 10 шт: дефицит по АРТ-001
-  state.payments.push(mkPay(dRomashka, 'ПП-1', 480000, -12));
+  state.payments.push(mkPay(dRomashka, 'ПП-1', 480000, -12, [{ itemId: iOgr.id, qty: 40, price: 12000 }]));
   state.waybills.push(mkWb(dRomashka, 'НК-1', 300000, -4, true, 'секции ограждений', [{ itemId: iOgr.id, qty: 25, price: 12000 }]));
   // СтальТрейд (закупка): предоплата 6 дней назад → поставка 50 т через 8 дней
-  state.payments.push(mkPay(dStal, 'ПП-2', 750000, -6));
+  state.payments.push(mkPay(dStal, 'ПП-2', 750000, -6, [{ itemId: iMet.id, qty: 50, price: 15000 }]));
   // АгроСнаб (закупка): приёмка 8 т 10 дней назад → оплата через 5 дней
   state.waybills.push(mkWb(dAgro, 'НК-2', 320000, -10, true, 'удобрения', [{ itemId: iUdo.id, qty: 8, price: 40000 }]));
   // ТехноДом (продажа): отгрузка 30 дней назад, оплата частичная → просроченная дебиторка;
@@ -2541,6 +2640,7 @@ function sanitizeImported(s) {
         datePaymentExecution: p.datePaymentExecution,
         dateMaterialPlan: isDate(p.dateMaterialPlan) ? p.dateMaterialPlan : addDays(p.datePaymentExecution, deal.shipDays + (deal.deliveryDays || 0)),
         comment: str(p.comment), posted: !!p.posted,
+        _srcLines: p.lines,
       };
     });
 
@@ -2593,6 +2693,7 @@ function sanitizeImported(s) {
     : [];
   for (const d of deals) { d.lines = cleanLines(d._srcLines); delete d._srcLines; }
   for (const w of waybills) { w.lines = cleanLines(w._srcLines); delete w._srcLines; }
+  for (const pm of payments) { pm.lines = cleanLines(pm._srcLines); delete pm._srcLines; }
 
   const otherPayments = (s.otherPayments || []).filter((p) => p && typeof p === 'object' && str(p.name) && num(p.amount) && isDate(p.date))
     .map((p) => ({
